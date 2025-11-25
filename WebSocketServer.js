@@ -518,6 +518,17 @@ function findServerByIp(ip) {
    return null;
 }
 
+function getConnectedDistributedServers() {
+    return Array.from(distributedServers.values()).map(s => ({
+        id: s.ws.serverId,
+        name: s.serverName || s.ws.serverId
+    }));
+}
+
+function getDistributedServerInfo(serverId) {
+    return distributedServerIPs.get(serverId);
+}
+
 // 新增：专门广播给管理面板
 function broadcastToAdminPanel(data) {
     if (!wssInstance) return;
@@ -542,6 +553,8 @@ module.exports = {
     sendMessageToClient,
     executeDistributedTool,
     findServerByIp,
+    getConnectedDistributedServers,
+    getDistributedServerInfo,
     shutdown
 
 };

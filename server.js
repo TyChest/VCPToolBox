@@ -166,14 +166,45 @@ app.use(express.text({ limit: '300mb', type: 'text/plain' })); // 新增：用�
 // 新增：IP追踪中间件
 app.use((req, res, next) => {
     if (req.method === 'POST') {
-        let clientIp = req.ip;
+        // 尝试从各种可能的头部获取真实IP，因为 xgrok/ngrok 可能使用不同的头
+        let clientIp = req.headers['x-forwarded-for'] ||
+                       req.headers['x-real-ip'] ||
+                       req.headers['cf-connecting-ip'] || // Cloudflare
+                       req.ip;
+
+        // 如果 x-forwarded-for 包含多个IP，取第一个
+        if (clientIp && clientIp.indexOf(',') > -1) {
+            clientIp = clientIp.split(',')[0].trim();
+        }
+
         // 标准化IPv6映射的IPv4地址 (e.g., from '::ffff:127.0.0.1' to '127.0.0.1')
         if (clientIp && clientIp.substr(0, 7) === "::ffff:") {
             clientIp = clientIp.substr(7);
         }
         
+        // 覆盖 req.ip 以便后续中间件使用正确的 IP
+        Object.defineProperty(req, 'ip', {
+            configurable: true,
+            enumerable: true,
+            get: () => clientIp
+        });
+        
+        // --- 增强日志记录：如果 IP 是 127.0.0.1 且只有一个分布式服务器，则在日志中显示其真实 IP ---
+        let logIp = clientIp;
+        if (clientIp === '127.0.0.1' || clientIp === '::1') {
+            const connectedServers = webSocketServer.getConnectedDistributedServers();
+            if (connectedServers.length === 1) {
+                // 尝试获取该服务器上报的 IP 信息，用于日志显示
+                const serverInfo = webSocketServer.getDistributedServerInfo(connectedServers[0].id);
+                if (serverInfo && serverInfo.localIPs && serverInfo.localIPs.length > 0) {
+                    logIp = serverInfo.localIPs[0]; // 使用上报的本地 IP 进行日志记录
+                    console.log(`[IP Tracker] WARNING: Request IP is 127.0.0.1 (via proxy). Logging as client IP: ${logIp}`);
+                }
+            }
+        }
+        
         // 始终记录收到的POST请求IP
-        console.log(`[IP Tracker] Received POST request from IP: ${clientIp}`);
+        console.log(`[IP Tracker] Received POST request from IP: ${logIp} (Original: ${clientIp}, Headers: X-Forwarded-For=${req.headers['x-forwarded-for']}, X-Real-IP=${req.headers['x-real-ip']})`);
 
         const serverName = webSocketServer.findServerByIp(clientIp);
         if (serverName) {

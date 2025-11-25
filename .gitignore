@@ -175,3 +175,13 @@ image/fluxgen/
 **/.DS_Store
 .DS_Store?
 /.obsidian
+/Plugin/Gemini3ImageGen
+/image/nanobananagen
+/.file_cache
+agent_map.json
+Plugin/DailyHot/dailyhot_cache.md
+Plugin/RAGDiaryPlugin/meta_chain_vector_cache.json
+Plugin/RAGDiaryPlugin/semantic_groups.edit.json
+Plugin/RAGDiaryPlugin/semantic_groups.json
+/Plugin/RAGDiaryPlugin/semantic_vectors
+Plugin/RAGDiaryPlugin/rag_tags.json

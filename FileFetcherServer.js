@@ -106,7 +106,23 @@ async function fetchFile(fileUrl, requestIp) {
         throw new Error('FileFetcherServer 尚未初始化。');
     }
 
-    const serverId = webSocketServer.findServerByIp(requestIp);
+    let serverId = webSocketServer.findServerByIp(requestIp);
+
+    // 修复：如果未找到匹配的服务器ID，且只有一个分布式服务器连接，则默认使用该服务器作为回退
+    // 这处理了本地请求 (127.0.0.1) 以及通过反向代理 (xgrok/ngrok) 进来但IP不匹配的情况
+    if (!serverId) {
+        const connectedServers = webSocketServer.getConnectedDistributedServers();
+        if (connectedServers.length === 1) {
+            serverId = connectedServers[0].id;
+            console.log(`[FileFetcherServer] 请求IP (${requestIp}) 未找到特定映射。检测到唯一的分布式服务器 '${connectedServers[0].name}'，将使用它作为来源。`);
+        } else if (connectedServers.length > 1) {
+             // 如果有多个服务器，我们无法确定是哪一个
+             // 尝试记录更详细的错误信息，帮助调试
+             const serverNames = connectedServers.map(s => s.name).join(', ');
+             throw new Error(`请求IP (${requestIp}) 未匹配到已知服务器，且有多个分布式服务器连接 (${serverNames})，无法确定文件来源。请确保客户端正确上报了IP，或只连接一个分布式客户端。`);
+        }
+    }
+
     if (!serverId) {
         throw new Error(`根据IP [${requestIp}] 未找到任何已知的分布式服务器。`);
     }

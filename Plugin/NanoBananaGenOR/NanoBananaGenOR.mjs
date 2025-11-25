@@ -75,9 +75,9 @@ async function getImageDataFromUrl(url) {
     if (url.startsWith('file://')) {
         const { fileURLToPath } = await import('url');
         const { default: mime } = await import('mime-types');
-        const filePath = fileURLToPath(url);
 
         try {
+            const filePath = fileURLToPath(url);
             const buffer = await fs.readFile(filePath);
             const mimeType = mime.lookup(filePath) || 'application/octet-stream';
             console.error(`[NanoBananaGenOR] 成功直接读取本地文件: ${filePath}`);
@@ -85,7 +85,7 @@ async function getImageDataFromUrl(url) {
         } catch (e) {
             // 关键改进：当文件不存在(ENOENT)或路径格式对当前系统无效时(跨平台场景)，
             // 都应触发远程获取流程。
-            if (e.code === 'ENOENT' || e.code === 'ERR_INVALID_FILE_URL_PATH') {
+            if (e.code === 'ENOENT' || e.code === 'ERR_INVALID_FILE_URL_PATH' || e.message === 'File URL path must be absolute') {
                 const structuredError = new Error("本地文件无法直接访问，需要远程获取。");
                 structuredError.code = 'FILE_NOT_FOUND_LOCALLY';
                 structuredError.fileUrl = url;
