@@ -166,7 +166,13 @@ app.use(express.text({ limit: '300mb', type: 'text/plain' })); // 新增：用�
 // 新增：IP追踪中间件
 app.use((req, res, next) => {
     if (req.method === 'POST') {
-        let clientIp = req.ip;
+        let clientIp = req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.ip;
+        
+        // 如果 'x-forwarded-for' 包含多个IP，取第一个
+        if (clientIp && clientIp.includes(',')) {
+            clientIp = clientIp.split(',')[0].trim();
+        }
+
         // 标准化IPv6映射的IPv4地址 (e.g., from '::ffff:127.0.0.1' to '127.0.0.1')
         if (clientIp && clientIp.substr(0, 7) === "::ffff:") {
             clientIp = clientIp.substr(7);
