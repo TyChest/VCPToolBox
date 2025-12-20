@@ -998,6 +998,10 @@ class RAGDiaryPlugin {
                     // 注意：[[AIMemo=True]] 仅在深度 1 时检测 (已在外部检测并传入 isAIMemoLicensed)
                     // 但在递归过程中，我们需要传递这个 license 状态
                     
+                    // 🟢 关键修复：在每一层递归开始前，重置 globalProcessedDiaries，允许解析新出现的占位符
+                    // 但为了防止同一层内的无限循环，我们可以在 _processSingleSystemMessage 内部使用局部 Set
+                    const currentLayerProcessedDiaries = new Set();
+
                     const ragProcessedContent = await this._processSingleSystemMessage(
                         currentContent,
                         queryVector,
@@ -1006,7 +1010,7 @@ class RAGDiaryPlugin {
                         combinedQueryForDisplay,
                         dynamicK,
                         timeRanges,
-                        globalProcessedDiaries,
+                        currentLayerProcessedDiaries, // 使用当前层的 Set
                         isAIMemoLicensed // 始终传递初始检测到的 license
                     );
                     
@@ -1033,15 +1037,6 @@ class RAGDiaryPlugin {
                         }
                     }
                 }
-                
-                // 3. 深度解析结束后，统一触发 AIMemo 加工 (如果配置了且有相关内容)
-                // 注意：_processSingleSystemMessage 内部已经处理了 AIMemo 的聚合请求，
-                // 但如果是递归产生的新 AIMemo 请求，可能需要在每一层处理，或者在最后统一处理。
-                // 目前 _processSingleSystemMessage 是自包含的，它会处理当次调用中发现的 AIMemo 请求。
-                // 所以每一层的 AIMemo 都会被即时处理。
-                // 这里的注释 "当所有深度解析结束之后，一并再触发将内容进行一次统一的 AIMemo 加工"
-                // 实际上 RAGDiaryPlugin 的架构是基于占位符替换的，AIMemo 也是替换占位符。
-                // 所以现有的逐层替换逻辑已经满足了 "统一加工" 的效果（因为最终结果是所有层替换后的总和）。
                 
                 newMessages[index].content = currentContent;
             }
@@ -1152,7 +1147,9 @@ class RAGDiaryPlugin {
         // 移除全局 AIMemo 开关占位符，因为它只作为许可证，不应出现在最终输出中
         processedContent = processedContent.replace(/\[\[AIMemo=True\]\]/g, '');
 
-        const ragDeclarations = [...processedContent.matchAll(/\[\[(.*?)日记本(.*?)\]\]/g)];
+        // 🟢 关键修复：在深度递归时，元思考链的占位符可能被解析为包含“日记本”字样的内容
+        // 我们需要先提取所有占位符，确保它们在被替换前是完整的
+        const ragDeclarations = [...processedContent.matchAll(/\[\[(?!VCP元思考)(.*?)日记本(.*?)\]\]/g)];
         const fullTextDeclarations = [...processedContent.matchAll(/<<(.*?)日记本>>/g)];
         const hybridDeclarations = [...processedContent.matchAll(/《《(.*?)日记本(.*?)》》/g)];
         const metaThinkingDeclarations = [...processedContent.matchAll(/\[\[VCP元思考(.*?)\]\]/g)];
