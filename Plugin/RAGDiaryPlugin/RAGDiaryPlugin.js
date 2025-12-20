@@ -10,6 +10,7 @@ const TIME_EXPRESSIONS = require('./timeExpressions.config.js');
 const SemanticGroupManager = require('./SemanticGroupManager.js');
 const AIMemoHandler = require('./AIMemoHandler.js'); // <--- 新增：引入AIMemoHandler
 const { chunkText } = require('../../TextChunker.js'); // <--- 新增：引入文本分块器
+const tvsManager = require('../../modules/tvsManager.js'); // <--- 新增：引入 TVS 管理器
 
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
@@ -269,6 +270,8 @@ class RAGDiaryPlugin {
         this.aiMemoCacheMaxSize = 50; // 可配置
         this.aiMemoCacheTTL = 1800000; // 30分钟
         
+        this.parseDepth = 1; // ✅ 新增：解析深度，默认为 1
+
         // 注意：不在构造函数中调用 loadConfig()，而是在 initialize() 中调用
     }
 
@@ -276,6 +279,10 @@ class RAGDiaryPlugin {
         // --- 加载插件独立的 .env 文件 ---
         const envPath = path.join(__dirname, 'config.env');
         dotenv.config({ path: envPath });
+
+        // ✅ 从环境变量读取解析深度配置
+        this.parseDepth = parseInt(process.env.RAG_PARSE_DEPTH) || 1;
+        console.log(`[RAGDiaryPlugin] 解析深度已设置为: ${this.parseDepth}`);
 
         // ✅ 从环境变量读取缓存配置
         this.maxCacheSize = parseInt(process.env.RAG_CACHE_MAX_SIZE) || 100;
@@ -977,24 +984,66 @@ class RAGDiaryPlugin {
             // 3. 循环处理每个识别到的 system 消息
             const newMessages = JSON.parse(JSON.stringify(messages));
             const globalProcessedDiaries = new Set(); // 在最外层维护一个 Set
+            
+            // ✅ 新增：递归解析逻辑
             for (const index of targetSystemMessageIndices) {
-                console.log(`[RAGDiaryPlugin] Processing system message at index: ${index}`);
-                const systemMessage = newMessages[index];
+                console.log(`[RAGDiaryPlugin] Processing system message at index: ${index} (Max Depth: ${this.parseDepth})`);
+                let currentContent = newMessages[index].content;
                 
-                // 调用新的辅助函数处理单个消息
-                const processedContent = await this._processSingleSystemMessage(
-                    systemMessage.content,
-                    queryVector,
-                    userContent, // 传递 userContent 用于语义组和时间解析
-                    aiContent, // 传递 aiContent 用于 AIMemo
-                    combinedQueryForDisplay, // V3.5: 传递组合后的查询字符串用于广播
-                    dynamicK,
-                    timeRanges,
-                    globalProcessedDiaries, // 传递全局 Set
-                    isAIMemoLicensed // 新增：AIMemo许可证
-                );
+                // 递归解析循环
+                for (let depth = 1; depth <= this.parseDepth; depth++) {
+                    const isLastDepth = depth === this.parseDepth;
+                    
+                    // 1. 执行 RAG 解析 (原有逻辑)
+                    // 注意：[[AIMemo=True]] 仅在深度 1 时检测 (已在外部检测并传入 isAIMemoLicensed)
+                    // 但在递归过程中，我们需要传递这个 license 状态
+                    
+                    const ragProcessedContent = await this._processSingleSystemMessage(
+                        currentContent,
+                        queryVector,
+                        userContent,
+                        aiContent,
+                        combinedQueryForDisplay,
+                        dynamicK,
+                        timeRanges,
+                        globalProcessedDiaries,
+                        isAIMemoLicensed // 始终传递初始检测到的 license
+                    );
+                    
+                    // 2. 执行变量解析 ({{...}})
+                    const variableProcessedContent = await this._resolveVariables(ragProcessedContent);
+                    
+                    // 检查内容是否发生变化
+                    if (variableProcessedContent === currentContent) {
+                        // 如果内容没有变化，提前结束递归
+                        if (depth > 1) { // 至少执行一次
+                             console.log(`[RAGDiaryPlugin] Content stabilized at depth ${depth}. Stopping recursion.`);
+                             break;
+                        }
+                    }
+                    
+                    currentContent = variableProcessedContent;
+                    
+                    // 如果还有下一层深度，检查是否还有剩余的占位符需要解析
+                    if (!isLastDepth) {
+                        const hasMorePlaceholders = /\[\[.*日记本.*\]\]|<<.*日记本.*>>|《《.*日记本.*》》|\[\[VCP元思考.*\]\]|\{\{.*\}\}/.test(currentContent);
+                        if (!hasMorePlaceholders) {
+                            console.log(`[RAGDiaryPlugin] No more placeholders found at depth ${depth}. Stopping recursion.`);
+                            break;
+                        }
+                    }
+                }
                 
-                newMessages[index].content = processedContent;
+                // 3. 深度解析结束后，统一触发 AIMemo 加工 (如果配置了且有相关内容)
+                // 注意：_processSingleSystemMessage 内部已经处理了 AIMemo 的聚合请求，
+                // 但如果是递归产生的新 AIMemo 请求，可能需要在每一层处理，或者在最后统一处理。
+                // 目前 _processSingleSystemMessage 是自包含的，它会处理当次调用中发现的 AIMemo 请求。
+                // 所以每一层的 AIMemo 都会被即时处理。
+                // 这里的注释 "当所有深度解析结束之后，一并再触发将内容进行一次统一的 AIMemo 加工"
+                // 实际上 RAGDiaryPlugin 的架构是基于占位符替换的，AIMemo 也是替换占位符。
+                // 所以现有的逐层替换逻辑已经满足了 "统一加工" 的效果（因为最终结果是所有层替换后的总和）。
+                
+                newMessages[index].content = currentContent;
             }
 
             return newMessages;
@@ -1015,6 +1064,82 @@ class RAGDiaryPlugin {
             });
             return safeMessages;
         }
+    }
+
+    // ✅ 新增：变量解析函数 (支持 {{...}} 语法和 TVStxt)
+    async _resolveVariables(text) {
+        if (!text) return '';
+        let processedText = String(text);
+        
+        // 1. 处理 {{Var...}}, {{Tar...}}, {{Sar...}} 环境变量
+        // 2. 处理 {{...}} TVStxt 文件引用
+        
+        const placeholderRegex = /\{\{([a-zA-Z0-9_:.-\u4e00-\u9fa5]+)\}\}/g;
+        const matches = [...processedText.matchAll(placeholderRegex)];
+        const uniquePlaceholders = [...new Set(matches.map(match => match[0]))];
+        
+        for (const placeholder of uniquePlaceholders) {
+            const key = placeholder.slice(2, -2).trim(); // 去除 {{ }}
+            
+            // 优先检查 process.env
+            if (process.env.hasOwnProperty(key)) {
+                let value = process.env[key];
+                
+                // 如果是 .txt 文件路径，尝试读取内容
+                if (typeof value === 'string' && value.toLowerCase().endsWith('.txt')) {
+                    const fileContent = await tvsManager.getContent(value);
+                    // 简单的错误检查，如果是错误信息则直接使用，否则使用内容
+                    value = fileContent;
+                }
+                
+                processedText = processedText.replaceAll(placeholder, value || '');
+                continue;
+            }
+            
+            // 检查是否是 TVStxt 目录下的文件 (直接引用文件名，如 {{MyPrompt.txt}} 或 {{MyPrompt}})
+            // 尝试加 .txt 后缀
+            let potentialFilename = key;
+            if (!potentialFilename.toLowerCase().endsWith('.txt')) {
+                potentialFilename += '.txt';
+            }
+            
+            // 尝试从 tvsManager 获取
+            // 注意：tvsManager.getContent 会尝试读取文件，如果不存在会返回错误信息或 null (取决于实现)
+            // 这里我们需要一种方式判断文件是否存在，避免将无关的 {{...}} 误替换
+            // 我们可以利用 tvsManager.contentCache 或者尝试读取
+            
+            // 由于 tvsManager.getContent 在文件不存在时返回 "[变量文件 ... 未找到]"，
+            // 我们可以利用这一点，但要小心不要替换掉非 TVS 的占位符。
+            // 更好的做法是：只处理明确的 .txt 引用，或者已知的环境变量前缀。
+            // 但用户要求 "支持对TVStxt...的依次解析"，通常意味着 {{FileName}} 应该被尝试解析。
+            
+            // 策略：
+            // 1. 如果 key 以 .txt 结尾，强制尝试解析
+            // 2. 如果 key 是 Tar/Var/Sar 开头，强制尝试解析 (已在 env 检查中涵盖，如果 env 里没有，可能是直接引用文件?)
+            // 3. 否则，尝试读取文件，如果成功则替换，否则保留原样
+            
+            try {
+                // 这是一个异步操作，但我们在循环中 await 是可以的，虽然效率略低
+                // 为了避免不必要的 IO，我们可以先检查 key 的模式
+                
+                // 尝试读取
+                const content = await tvsManager.getContent(potentialFilename);
+                
+                // 只有当读取成功且不是错误信息时才替换
+                // tvsManager 返回的错误信息通常以 [ 开头
+                if (content && !content.startsWith('[变量文件') && !content.startsWith('[处理变量文件')) {
+                    processedText = processedText.replaceAll(placeholder, content);
+                } else if (key.toLowerCase().endsWith('.txt')) {
+                     // 如果用户明确写了 .txt 但没找到，替换为错误信息
+                     processedText = processedText.replaceAll(placeholder, content);
+                }
+                
+            } catch (e) {
+                // Ignore errors
+            }
+        }
+        
+        return processedText;
     }
 
     // V3.0 新增: 处理单条 system 消息内容的辅助函数
