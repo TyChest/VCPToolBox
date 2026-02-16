@@ -4,6 +4,9 @@ const path = require('path');
 const lunarCalendar = require('chinese-lunar-calendar');
 const agentManager = require('./agentManager.js'); // 引入新的Agent管理器
 const tvsManager = require('./tvsManager.js'); // 引入新的TVS管理器
+const { parseMultimodalParams, hasMultimodalMode, requiresContentParts } = require('./multimodalSyntaxParser.js');
+const mediaDescriptionManager = require('./mediaDescriptionManager.js');
+const multimediaRecognizer = require('./multimediaRecognizer.js');
 
 const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'Asia/Shanghai';
 const REPORT_TIMEZONE = process.env.REPORT_TIMEZONE || 'Asia/Shanghai'; // 新增：用于控制 AI 报告的时间，默认回退到中国时区
@@ -258,8 +261,9 @@ async function replacePriorityVariables(text, context, role) {
         processedText = processedText.replaceAll(placeholder, emojiList || `[${emojiName}列表不可用]`);
     }
 
-    // --- 日记本处理 (已修复循环风险) ---
-    const diaryPlaceholderRegex = /\{\{([^{}]+?)日记本\}\}/g;
+    // --- 日记本处理（支持多模态参数 ::OverBase64 等） ---
+    // 改造后的正则：支持 {{XX日记本}} 和 {{XX日记本::参数}} 两种格式
+    const diaryPlaceholderRegex = /\{\{([^{}]+?日记本(?:::[^{}]*)?)\}\}/g;
     let allDiariesData = {};
     const allDiariesDataString = pluginManager.getPlaceholderValue("{{AllCharacterDiariesData}}");
 
@@ -279,26 +283,307 @@ async function replacePriorityVariables(text, context, role) {
 
     // Step 2: Iterate through the unique placeholders and replace them.
     for (const placeholder of uniquePlaceholders) {
-        // Extract character name from placeholder like "{{小雨日记本}}" -> "小雨"
-        const characterNameMatch = placeholder.match(/\{\{([^{}]+?)日记本\}\}/);
-        if (characterNameMatch && characterNameMatch[1]) {
-            const characterName = characterNameMatch[1];
-            let diaryContent = `[${characterName}日记本内容为空或未从插件获取]`;
-            if (allDiariesData.hasOwnProperty(characterName)) {
-                diaryContent = allDiariesData[characterName];
+        // 提取捕获组内容
+        const captureMatch = placeholder.match(/\{\{([^{}]+?日记本(?:::[^{}]*)?)\}\}/);
+        if (!captureMatch || !captureMatch[1]) continue;
+
+        const captured = captureMatch[1];
+        const parsed = parseMultimodalParams(captured);
+        const characterName = parsed.diaryName;
+
+        // 获取文本日记内容
+        let diaryContent = `[${characterName}日记本内容为空或未从插件获取]`;
+        if (allDiariesData.hasOwnProperty(characterName)) {
+            diaryContent = allDiariesData[characterName];
+        }
+
+        // 检查是否有多模态参数
+        if (hasMultimodalMode(parsed)) {
+            // 多模态模式：处理多模态文件
+            try {
+                const multimodalContent = await _processMultimodalDiary(characterName, parsed, diaryContent, DEBUG_MODE);
+                processedText = processedText.replaceAll(placeholder, multimodalContent);
+            } catch (e) {
+                console.error(`[replacePriorityVariables] 多模态日记本处理失败 (${characterName}):`, e.message);
+                processedText = processedText.replaceAll(placeholder, diaryContent + `\n[多模态处理失败: ${e.message}]`);
             }
-            // Replace all instances of this specific placeholder.
-            // This is safe because we are iterating over a pre-determined list, not re-scanning the string.
-            processedText = processedText.replaceAll(placeholder, diaryContent);
+        } else {
+            // 纯文本模式：原有逻辑 + 附加多模态描述信息文本
+            let finalContent = diaryContent;
+            try {
+                const descTexts = await _getMultimediaDescriptionTexts(characterName);
+                if (descTexts) {
+                    finalContent += '\n\n' + descTexts;
+                }
+            } catch (e) {
+                if (DEBUG_MODE) console.warn(`[replacePriorityVariables] 附加多模态描述失败 (${characterName}):`, e.message);
+            }
+            processedText = processedText.replaceAll(placeholder, finalContent);
         }
     }
 
     return processedText;
 }
 
+/**
+ * 处理多模态日记本占位符
+ * @param {string} characterName - 日记本名称
+ * @param {object} parsed - 解析后的多模态参数
+ * @param {string} textContent - 文本日记内容
+ * @param {boolean} debugMode - 调试模式
+ * @returns {string|object} 文本内容或 ContentPart 数组标记
+ */
+async function _processMultimodalDiary(characterName, parsed, textContent, debugMode) {
+    const dailyNoteRootPath = process.env.KNOWLEDGEBASE_ROOT_PATH || path.join(__dirname, '..', 'dailynote');
+    const dirPath = path.join(dailyNoteRootPath, characterName);
+    const { textFiles, multimediaFiles } = await mediaDescriptionManager.scanDirectory(dirPath);
+
+    // 确定目标多模态文件
+    const targets = parsed.specifiedFiles.length > 0
+        ? multimediaFiles.filter(f => parsed.specifiedFiles.includes(f))
+        : multimediaFiles;
+
+    // 确定目标文本文件（如果指定了特定 .txt/.md 文件）
+    const specifiedTextFiles = parsed.specifiedFiles.filter(f => {
+        const ext = path.extname(f).toLowerCase();
+        return ext === '.txt' || ext === '.md';
+    });
+
+    switch (parsed.mode) {
+        case 'OverBase64': {
+            // 文本 + 描述信息（空描述先 AI 识别）
+            let parts = [];
+
+            // 文本部分
+            if (!parsed.flags.noText) {
+                const textSrc = specifiedTextFiles.length > 0 ? specifiedTextFiles : textFiles;
+                const text = await mediaDescriptionManager.readTextFiles(dirPath, textSrc);
+                if (text) parts.push(text);
+            }
+
+            // 多模态描述部分
+            for (const mf of targets) {
+                const filePath = path.join(dirPath, mf);
+                let desc = await mediaDescriptionManager.readDescription(filePath);
+
+                // 空描述 → AI 识别
+                if ((!desc || !desc.description) || parsed.flags.noCaching) {
+                    desc = await multimediaRecognizer.recognizeAndDescribe(
+                        filePath, parsed.presetName, parsed.flags.noCaching
+                    );
+                }
+
+                if (desc) {
+                    const rendered = parsed.flags.tagOnly
+                        ? mediaDescriptionManager.renderTagOnly(filePath, desc)
+                        : mediaDescriptionManager.renderDescription(filePath, desc);
+                    if (rendered) parts.push(rendered);
+                }
+            }
+
+            return parts.join('\n\n');
+        }
+
+        case 'ShowBase64': {
+            // 文本 + 原始文件 Base64（返回 ContentPart 标记）
+            let contentParts = [];
+
+            // 文本部分
+            if (!parsed.flags.noText) {
+                const textSrc = specifiedTextFiles.length > 0 ? specifiedTextFiles : textFiles;
+                const text = await mediaDescriptionManager.readTextFiles(dirPath, textSrc);
+                if (text) contentParts.push({ type: 'text', text });
+            }
+
+            // 多模态文件 Base64
+            for (const mf of targets) {
+                const filePath = path.join(dirPath, mf);
+                if (mediaDescriptionManager.isBase64Sendable(mf)) {
+                    contentParts.push(await mediaDescriptionManager.buildImageContentPart(filePath));
+                }
+            }
+
+            // 返回 JSON 标记，chatCompletionHandler 会识别并转换
+            return `<<<[MULTIMODAL_CONTENT_PARTS]>>>${JSON.stringify(contentParts)}<<<[END_MULTIMODAL_CONTENT_PARTS]>>>`;
+        }
+
+        case 'ShowBase64+': {
+            // 文本 + 描述信息 + 原始文件 Base64
+            let contentParts = [];
+
+            // 文本部分
+            if (!parsed.flags.noText) {
+                const textSrc = specifiedTextFiles.length > 0 ? specifiedTextFiles : textFiles;
+                const text = await mediaDescriptionManager.readTextFiles(dirPath, textSrc);
+                if (text) contentParts.push({ type: 'text', text });
+            }
+
+            // 多模态文件：描述 + Base64
+            for (const mf of targets) {
+                const filePath = path.join(dirPath, mf);
+                let desc = await mediaDescriptionManager.readDescription(filePath);
+
+                // 空描述 → AI 识别
+                if ((!desc || !desc.description) || parsed.flags.noCaching) {
+                    desc = await multimediaRecognizer.recognizeAndDescribe(
+                        filePath, parsed.presetName, parsed.flags.noCaching
+                    );
+                }
+
+                // 添加描述文本
+                if (desc) {
+                    const rendered = parsed.flags.tagOnly
+                        ? mediaDescriptionManager.renderTagOnly(filePath, desc)
+                        : mediaDescriptionManager.renderDescription(filePath, desc);
+                    if (rendered) contentParts.push({ type: 'text', text: rendered });
+                }
+
+                // 添加原始文件 Base64
+                if (mediaDescriptionManager.isBase64Sendable(mf)) {
+                    contentParts.push(await mediaDescriptionManager.buildImageContentPart(filePath));
+                }
+            }
+
+            return `<<<[MULTIMODAL_CONTENT_PARTS]>>>${JSON.stringify(contentParts)}<<<[END_MULTIMODAL_CONTENT_PARTS]>>>`;
+        }
+
+        default:
+            return textContent;
+    }
+}
+
+/**
+ * 获取日记本目录中所有多模态文件的描述信息文本（用于无参数的 {{XX日记本}} 附加）
+ */
+async function _getMultimediaDescriptionTexts(characterName) {
+    const dailyNoteRootPath = process.env.KNOWLEDGEBASE_ROOT_PATH || path.join(__dirname, '..', 'dailynote');
+    const dirPath = path.join(dailyNoteRootPath, characterName);
+    const { multimediaFiles } = await mediaDescriptionManager.scanDirectory(dirPath);
+
+    if (multimediaFiles.length === 0) return null;
+
+    const descTexts = [];
+    for (const mf of multimediaFiles) {
+        const filePath = path.join(dirPath, mf);
+        const desc = await mediaDescriptionManager.readDescription(filePath);
+        if (desc && desc.description) {
+            const rendered = mediaDescriptionManager.renderDescription(filePath, desc);
+            if (rendered) descTexts.push(rendered);
+        }
+    }
+
+    return descTexts.length > 0 ? descTexts.join('\n\n') : null;
+}
+
+/**
+ * 分层解析方法：仅解析 Sar 变量
+ */
+async function replaceSarVariables(text, model, context) {
+    if (text == null) return '';
+    let processedText = String(text);
+    // 复用 replaceOtherVariables 中的 Sar 逻辑
+    const { pluginManager, cachedEmojiLists, detectors, superDetectors, DEBUG_MODE } = context;
+    const role = 'system'; // Sar 仅在 system 角色中生效
+
+    const sarPlaceholderRegex = /\{\{(SarPrompt\d+)\}\}/g;
+    const matches = [...processedText.matchAll(sarPlaceholderRegex)];
+    const uniquePlaceholders = [...new Set(matches.map(match => match[0]))];
+
+    for (const placeholder of uniquePlaceholders) {
+        const promptKey = placeholder.substring(2, placeholder.length - 2);
+        const numberMatch = promptKey.match(/\d+$/);
+        if (!numberMatch) continue;
+        const index = numberMatch[0];
+        const modelKey = `SarModel${index}`;
+        const models = process.env[modelKey];
+        let promptValue = process.env[promptKey];
+        let replacementText = '';
+        if (models && promptValue) {
+            const modelList = models.split(',').map(m => m.trim().toLowerCase());
+            if (model && modelList.includes(model.toLowerCase())) {
+                if (typeof promptValue === 'string' && promptValue.toLowerCase().endsWith('.txt')) {
+                    const fileContent = await tvsManager.getContent(promptValue);
+                    if (!fileContent.startsWith('[变量文件') && !fileContent.startsWith('[处理变量文件')) {
+                        promptValue = fileContent;
+                    }
+                }
+                replacementText = promptValue;
+            }
+        }
+        const placeholderRegExp = new RegExp(placeholder.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'g');
+        processedText = processedText.replace(placeholderRegExp, replacementText);
+    }
+    return processedText;
+}
+
+/**
+ * 分层解析方法：解析 Var + Sar 变量
+ */
+async function replaceVarVariables(text, model, context) {
+    if (text == null) return '';
+    let processedText = String(text);
+    // Tar/Var 变量
+    for (const envKey in process.env) {
+        if (envKey.startsWith('Var')) {
+            const placeholder = `{{${envKey}}}`;
+            if (processedText.includes(placeholder)) {
+                const value = process.env[envKey];
+                if (value && typeof value === 'string' && value.toLowerCase().endsWith('.txt')) {
+                    const fileContent = await tvsManager.getContent(value);
+                    if (!fileContent.startsWith('[变量文件') && !fileContent.startsWith('[处理变量文件')) {
+                        processedText = processedText.replaceAll(placeholder, fileContent);
+                    } else {
+                        processedText = processedText.replaceAll(placeholder, fileContent);
+                    }
+                } else {
+                    processedText = processedText.replaceAll(placeholder, value || `[未配置 ${envKey}]`);
+                }
+            }
+        }
+    }
+    // 然后解析 Sar
+    processedText = await replaceSarVariables(processedText, model, context);
+    return processedText;
+}
+
+/**
+ * 分层解析方法：解析 Tar + Var + Sar 变量
+ */
+async function replaceTarVariables(text, model, context) {
+    if (text == null) return '';
+    let processedText = String(text);
+    // Tar 变量
+    for (const envKey in process.env) {
+        if (envKey.startsWith('Tar')) {
+            const placeholder = `{{${envKey}}}`;
+            if (processedText.includes(placeholder)) {
+                const value = process.env[envKey];
+                if (value && typeof value === 'string' && value.toLowerCase().endsWith('.txt')) {
+                    const fileContent = await tvsManager.getContent(value);
+                    if (!fileContent.startsWith('[变量文件') && !fileContent.startsWith('[处理变量文件')) {
+                        processedText = processedText.replaceAll(placeholder, fileContent);
+                    } else {
+                        processedText = processedText.replaceAll(placeholder, fileContent);
+                    }
+                } else {
+                    processedText = processedText.replaceAll(placeholder, value || `[未配置 ${envKey}]`);
+                }
+            }
+        }
+    }
+    // 然后解析 Var + Sar
+    processedText = await replaceVarVariables(processedText, model, context);
+    return processedText;
+}
+
 module.exports = {
     // 导出主函数，并重命名旧函数以供内部调用
     replaceAgentVariables: resolveAllVariables,
+    resolveAllVariables,
     replaceOtherVariables,
-    replacePriorityVariables
+    replacePriorityVariables,
+    // 分层解析方法（用于召回内容多次解析）
+    replaceTarVariables,
+    replaceVarVariables,
+    replaceSarVariables
 };

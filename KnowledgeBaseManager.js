@@ -12,6 +12,7 @@ const { getEmbeddingsBatch } = require('./EmbeddingUtils');
 const EPAModule = require('./EPAModule');
 const ResidualPyramid = require('./ResidualPyramid');
 const ResultDeduplicator = require('./ResultDeduplicator'); // ✅ Tagmemo v4 requirement
+const mediaDescriptionManager = require('./modules/mediaDescriptionManager.js'); // 多模态描述信息管理
 
 // 尝试加载 Rust Vexus 引擎
 let VexusIndex = null;
@@ -881,7 +882,6 @@ class KnowledgeBaseManager {
         if (!this.watcher) {
             const handleFile = (filePath) => {
                 const relPath = path.relative(this.config.rootPath, filePath);
-                // 提取第一级目录作为日记本名称
                 const parts = relPath.split(path.sep);
                 const diaryName = parts.length > 1 ? parts[0] : 'Root';
 
@@ -889,17 +889,158 @@ class KnowledgeBaseManager {
                 const fileName = path.basename(relPath);
                 if (this.config.ignorePrefixes.some(prefix => fileName.startsWith(prefix))) return;
                 if (this.config.ignoreSuffixes.some(suffix => fileName.endsWith(suffix))) return;
-                if (!filePath.match(/\.(md|txt)$/i)) return;
 
-                this.pendingFiles.add(filePath);
-                if (this.pendingFiles.size >= this.config.maxBatchSize) {
-                    this._flushBatch();
-                } else {
-                    this._scheduleBatch();
+                const isTextFile = filePath.match(/\.(md|txt)$/i);
+                const isDescFile = filePath.match(/\.desc\.json$/i);
+                const isMultimediaFile = mediaDescriptionManager.isMultimediaFile(fileName);
+
+                if (isTextFile || isDescFile) {
+                    this.pendingFiles.add(filePath);
+                    if (this.pendingFiles.size >= this.config.maxBatchSize) {
+                        this._flushBatch();
+                    } else {
+                        this._scheduleBatch();
+                    }
+                } else if (isMultimediaFile) {
+                    this._handleMultimediaFileAdd(filePath, diaryName);
                 }
             };
+
+            const handleUnlink = (filePath) => {
+                const fileName = path.basename(filePath);
+                const isMultimediaFile = mediaDescriptionManager.isMultimediaFile(fileName);
+
+                if (isMultimediaFile) {
+                    // 延迟处理：改名表现为 unlink+add，需等待 add 事件后再决定是清理还是协调
+                    const dirPath = path.dirname(filePath);
+                    if (!this._pendingReconcileDirs) this._pendingReconcileDirs = new Set();
+                    if (!this._pendingDeletedMultimedia) this._pendingDeletedMultimedia = new Set();
+                    this._pendingReconcileDirs.add(dirPath);
+                    this._pendingDeletedMultimedia.add(filePath);
+                    if (this._reconcileTimer) clearTimeout(this._reconcileTimer);
+                    this._reconcileTimer = setTimeout(() => this._reconcilePendingDirs(), 2000);
+                }
+
+                this._handleDelete(filePath);
+            };
+
             this.watcher = chokidar.watch(this.config.rootPath, { ignored: /(^|[\/\\])\../, ignoreInitial: !this.config.fullScanOnStartup });
-            this.watcher.on('add', handleFile).on('change', handleFile).on('unlink', fp => this._handleDelete(fp));
+            this.watcher.on('add', handleFile).on('change', handleFile).on('unlink', handleUnlink);
+        }
+    }
+
+    async _handleMultimediaFileAdd(filePath, diaryName) {
+        // 去重：防止 chokidar 的 add+change 双事件导致重复处理
+        if (!this._multimediaProcessing) this._multimediaProcessing = new Set();
+        if (this._multimediaProcessing.has(filePath)) return;
+        this._multimediaProcessing.add(filePath);
+        setTimeout(() => this._multimediaProcessing.delete(filePath), 5000);
+
+        try {
+            const descPath = mediaDescriptionManager.getDescPath(filePath);
+            try {
+                await fs.access(descPath);
+                return;
+            } catch { /* sidecar not found, continue */ }
+
+            const dirPath = path.dirname(filePath);
+            const { reconciled } = await mediaDescriptionManager.reconcileOrphanedDescFiles(dirPath);
+            if (reconciled.length > 0) {
+                console.log(`[KnowledgeBase] 🔗 多模态文件改名协调: ${reconciled.map(r => r.oldName + ' → ' + r.newName).join(', ')}`);
+                try {
+                    await fs.access(descPath);
+                    this.pendingFiles.add(descPath);
+                    this._scheduleBatch();
+                    return;
+                } catch { /* still no sidecar after reconcile */ }
+            }
+
+            const embeddedDesc = await mediaDescriptionManager._readEmbeddedMetadata(filePath);
+            if (embeddedDesc && embeddedDesc.description) {
+                await mediaDescriptionManager.writeDescription(filePath, embeddedDesc);
+                console.log(`[KnowledgeBase] 📝 自动从嵌入式描述生成 sidecar: ${path.basename(filePath)}`);
+            }
+        } catch (e) {
+            console.warn(`[KnowledgeBase] 多模态文件处理失败 ${filePath}:`, e.message);
+        }
+    }
+
+    async _reconcilePendingDirs() {
+        if (!this._pendingReconcileDirs || this._pendingReconcileDirs.size === 0) return;
+        const dirs = Array.from(this._pendingReconcileDirs);
+        this._pendingReconcileDirs.clear();
+        const deletedFiles = this._pendingDeletedMultimedia ? new Set(this._pendingDeletedMultimedia) : new Set();
+        if (this._pendingDeletedMultimedia) this._pendingDeletedMultimedia.clear();
+
+        // 收集已被协调（改名）的原文件路径
+        const reconciledOriginals = new Set();
+
+        for (const dirPath of dirs) {
+            try {
+                const { reconciled } = await mediaDescriptionManager.reconcileOrphanedDescFiles(dirPath);
+                if (reconciled.length > 0) {
+                    console.log(`[KnowledgeBase] 🔗 延迟协调完成: ${reconciled.map(r => r.oldName + ' → ' + r.newName).join(', ')}`);
+                    for (const r of reconciled) {
+                        const newDescPath = path.join(dirPath, r.newName + '.desc.json');
+                        this.pendingFiles.add(newDescPath);
+                        // 标记已协调的原文件路径
+                        reconciledOriginals.add(path.join(dirPath, r.oldName));
+                    }
+                    this._scheduleBatch();
+                }
+            } catch (e) {
+                console.warn(`[KnowledgeBase] 延迟协调失败 ${dirPath}:`, e.message);
+            }
+        }
+
+        // 对未被协调的已删除多模态文件，执行 sidecar 和索引清理
+        for (const filePath of deletedFiles) {
+            if (reconciledOriginals.has(filePath)) continue; // 已改名，跳过
+            // 检查文件是否真的不存在了（排除 add 事件已恢复的情况）
+            try {
+                await fs.access(filePath);
+                // 文件又出现了（可能是跨目录移动后又移回），跳过
+            } catch {
+                // 文件确实不存在，清理 sidecar 和索引
+                await this._cleanupMultimediaDelete(filePath);
+            }
+        }
+    }
+
+    /**
+     * 多模态文件被真正删除（非改名）时：清理对应的 sidecar 文件和索引条目
+     */
+    async _cleanupMultimediaDelete(filePath) {
+        const descPath = mediaDescriptionManager.getDescPath(filePath);
+        const relDescPath = path.relative(this.config.rootPath, descPath);
+
+        try {
+            // 检查 sidecar 是否存在
+            await fs.access(descPath);
+
+            // 从数据库和向量索引中删除 sidecar 对应的条目
+            const row = this.db.prepare('SELECT id, diary_name FROM files WHERE path = ?').get(relDescPath);
+            if (row) {
+                const chunkIds = this.db.prepare('SELECT id FROM chunks WHERE file_id = ?').all(row.id);
+                this.db.prepare('DELETE FROM files WHERE id = ?').run(row.id);
+
+                const idx = await this._getOrLoadDiaryIndex(row.diary_name);
+                if (idx && idx.remove) {
+                    chunkIds.forEach(c => idx.remove(c.id));
+                    this._scheduleIndexSave(row.diary_name);
+                }
+                console.log(`[KnowledgeBase] 🗑️ 多模态文件删除，已清理索引: ${path.basename(filePath)} (${chunkIds.length} chunks)`);
+            }
+
+            // 删除 sidecar 文件
+            await fs.unlink(descPath);
+            console.log(`[KnowledgeBase] 🗑️ 已删除孤立 sidecar: ${path.basename(descPath)}`);
+        } catch (e) {
+            if (e.code === 'ENOENT') {
+                // sidecar 不存在，无需清理
+                return;
+            }
+            console.warn(`[KnowledgeBase] 多模态文件删除清理失败 ${filePath}:`, e.message);
         }
     }
 
@@ -932,7 +1073,22 @@ class KnowledgeBaseManager {
                     const row = checkFile.get(relPath);
                     if (row && row.mtime === stats.mtimeMs && row.size === stats.size) return;
 
-                    const content = await fs.readFile(filePath, 'utf-8');
+                    let content;
+                    if (filePath.endsWith('.desc.json')) {
+                        // .desc.json 侧车文件：渲染为虚拟文本条目
+                        try {
+                            const descData = JSON.parse(await fs.readFile(filePath, 'utf-8'));
+                            const mediaFilePath = filePath.replace(/\.desc\.json$/, '');
+                            content = mediaDescriptionManager.renderDescription(mediaFilePath, descData);
+                            if (!content) return; // 描述为空，跳过
+                        } catch (parseErr) {
+                            console.warn(`[KnowledgeBase] 解析 .desc.json 失败 ${filePath}:`, parseErr.message);
+                            return;
+                        }
+                    } else {
+                        content = await fs.readFile(filePath, 'utf-8');
+                    }
+
                     const checksum = crypto.createHash('md5').update(content).digest('hex');
 
                     if (row && row.checksum === checksum) {

@@ -11,6 +11,8 @@ const timezone = require('dayjs/plugin/timezone');
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
+const mediaDescriptionManager = require('../../modules/mediaDescriptionManager.js'); // 多模态描述信息管理
+
 const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'Asia/Shanghai';
 
 class AIMemoHandler {
@@ -19,6 +21,7 @@ class AIMemoHandler {
         this.config = {};
         this.promptTemplate = '';
         this.cache = cache; // ✅ 使用注入的缓存
+        this.beyondTextEnabled = false; // AIMemoBeyondText 开关
         // 不在构造函数中调用 loadConfig，而是在主插件初始化时调用
     }
 
@@ -269,7 +272,25 @@ class AIMemoHandler {
         
         const knowledgeBase = this._combineFiles(batchFiles);
         const prompt = this._buildPrompt(knowledgeBase, userContent, aiContent);
-        const aiResponse = await this._callAIModel(prompt);
+
+        // 多模态支持：当 beyondTextEnabled 时，收集可 Base64 发送的多模态文件
+        let multimediaContentParts = null;
+        if (this.beyondTextEnabled) {
+            multimediaContentParts = [];
+            for (const file of batchFiles) {
+                if (file.isMultimedia && file.multimediaPath && mediaDescriptionManager.isBase64Sendable(file.name.replace('.desc', ''))) {
+                    try {
+                        const contentPart = await mediaDescriptionManager.buildImageContentPart(file.multimediaPath);
+                        multimediaContentParts.push(contentPart);
+                    } catch (e) {
+                        console.warn(`[AIMemoHandler] 多模态文件 Base64 编码失败 ${file.multimediaPath}:`, e.message);
+                    }
+                }
+            }
+            if (multimediaContentParts.length === 0) multimediaContentParts = null;
+        }
+
+        const aiResponse = await this._callAIModel(prompt, multimediaContentParts);
         
         if (!aiResponse) {
             console.warn(`[AIMemoHandler] Batch ${batchIndex} failed, returning empty`);
@@ -290,13 +311,10 @@ class AIMemoHandler {
         const files = [];
         
         try {
-            const fileList = await fs.readdir(characterDirPath);
-            const relevantFiles = fileList.filter(file => {
-                const lowerCaseFile = file.toLowerCase();
-                return lowerCaseFile.endsWith('.txt') || lowerCaseFile.endsWith('.md');
-            }).sort();
+            const { textFiles, multimediaFiles } = await mediaDescriptionManager.scanDirectory(characterDirPath);
 
-            for (const file of relevantFiles) {
+            // 原有：读取文本文件
+            for (const file of textFiles) {
                 const filePath = path.join(characterDirPath, file);
                 try {
                     const content = await fs.readFile(filePath, 'utf-8');
@@ -308,6 +326,25 @@ class AIMemoHandler {
                     });
                 } catch (readErr) {
                     console.warn(`[AIMemoHandler] 无法读取文件 ${file}:`, readErr.message);
+                }
+            }
+
+            // 新增：读取多模态文件描述信息
+            for (const mf of multimediaFiles) {
+                const filePath = path.join(characterDirPath, mf);
+                const desc = await mediaDescriptionManager.readDescription(filePath);
+                if (desc?.description) {
+                    const rendered = mediaDescriptionManager.renderDescription(filePath, desc);
+                    if (rendered) {
+                        const tokens = this._estimateTokens(rendered);
+                        files.push({
+                            name: mf + '.desc',
+                            content: rendered,
+                            tokens: tokens,
+                            isMultimedia: true,
+                            multimediaPath: filePath
+                        });
+                    }
                 }
             }
         } catch (dirError) {
@@ -428,14 +465,26 @@ class AIMemoHandler {
     /**
      * 调用AI模型
      */
-    async _callAIModel(prompt) {
+    async _callAIModel(prompt, multimediaContentParts = null) {
         const maxRetries = 3;
         const retryDelay = 2000;
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                console.log(`[AIMemoHandler] Calling AI model (attempt ${attempt}/${maxRetries})...`);
+                console.log(`[AIMemoHandler] Calling AI model (attempt ${attempt}/${maxRetries})${multimediaContentParts ? ' [multimodal]' : ''}...`);
                 
+                // 构建消息内容：支持多模态
+                let messageContent;
+                if (multimediaContentParts && multimediaContentParts.length > 0) {
+                    // 多模态模式：text + image_url content parts
+                    messageContent = [
+                        { type: 'text', text: prompt },
+                        ...multimediaContentParts
+                    ];
+                } else {
+                    messageContent = prompt;
+                }
+
                 const response = await axios.post(
                     `${this.config.url}v1/chat/completions`,
                     {
@@ -443,7 +492,7 @@ class AIMemoHandler {
                         messages: [
                             {
                                 role: 'user',
-                                content: prompt
+                                content: messageContent
                             }
                         ],
                         temperature: 0.3, // 较低温度以保持一致性

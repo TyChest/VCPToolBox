@@ -1,0 +1,22 @@
+{
+  "name": "KnowledgeMediaDescriber",
+  "displayName": "多模态文件描述编辑器",
+  "version": "1.0.0",
+  "description": "管理知识库中多模态文件的描述信息、标签和预设。支持对多模态文件进行描述编辑、Tag增删改查、sidecar文件管理、文件重命名与迁移等操作。",
+  "pluginType": "hybridservice",
+  "entryPoint": {
+    "script": "KnowledgeMediaDescriber.js"
+  },
+  "communication": {
+    "protocol": "direct"
+  },
+  "capabilities": {
+    "invocationCommands": [
+      {
+        "command": "KnowledgeMediaDescriber",
+        "description": "多模态文件描述信息管理工具。支持以下操作：\n- list_diaries: 列出所有日记本目录\n- list_files: 列出指定日记本的多模态文件及描述状态\n- get_desc: 获取指定文件的描述信息（含description、tags、presetName等）\n- set_desc: 设置/更新文件的描述信息\n- update_tags: 更新文件的标签（支持追加、删除、替换）\n- delete_desc: 删除文件的sidecar描述文件\n- rename_file: 重命名多模态文件（同步更新sidecar）\n- move_file: 将多模态文件迁移到另一个日记本目录（同步迁移sidecar）\n- recognize: 触发AI识别生成描述信息",
+        "example": "<<<[TOOL_REQUEST]>>>\nKnowledgeMediaDescriber\n{\"action\":\"list_files\",\"diary\":\"XX\"}\n<<<[/TOOL_REQUEST]>>>\n\n<<<[TOOL_REQUEST]>>>\nKnowledgeMediaDescriber\n{\"action\":\"set_desc\",\"diary\":\"XX\",\"file\":\"photo.png\",\"description\":\"一张日落照片\",\"tags\":\"日落, 风景, 自然\"}\n<<<[/TOOL_REQUEST]>>>\n\n<<<[TOOL_REQUEST]>>>\nKnowledgeMediaDescriber\n{\"action\":\"update_tags\",\"diary\":\"XX\",\"file\":\"photo.png\",\"mode\":\"append\",\"tags\":\"新标签1, 新标签2\"}\n<<<[/TOOL_REQUEST]>>>\n\n<<<[TOOL_REQUEST]>>>\nKnowledgeMediaDescriber\n{\"action\":\"rename_file\",\"diary\":\"XX\",\"file\":\"old_name.png\",\"newName\":\"new_name.png\"}\n<<<[/TOOL_REQUEST]>>>\n\n<<<[TOOL_REQUEST]>>>\nKnowledgeMediaDescriber\n{\"action\":\"move_file\",\"diary\":\"XX\",\"file\":\"photo.png\",\"targetDiary\":\"YY\"}\n<<<[/TOOL_REQUEST]>>>"
+      }
+    ]
+  }
+}

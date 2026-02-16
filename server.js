@@ -39,6 +39,24 @@ function resolveAgentDir() {
     return absolutePath;
 }
 
+function resolveTvsDir() {
+    const configPath = process.env.TVS_DIR_PATH;
+    if (!configPath || typeof configPath !== 'string' || configPath.trim() === '') {
+        return path.join(__dirname, 'TVStxt');
+    }
+    const normalizedPath = path.normalize(configPath.trim());
+    return path.isAbsolute(normalizedPath) ? normalizedPath : path.resolve(__dirname, normalizedPath);
+}
+
+function resolveMultimediaPresetsDir() {
+    const configPath = process.env.MULTIMEDIA_PRESETS_PATH;
+    if (!configPath || typeof configPath !== 'string' || configPath.trim() === '') {
+        return path.join(__dirname, 'MultimediaPresets');
+    }
+    const normalizedPath = path.normalize(configPath.trim());
+    return path.isAbsolute(normalizedPath) ? normalizedPath : path.resolve(__dirname, normalizedPath);
+}
+
 AGENT_DIR = resolveAgentDir();
 
 // 确保目录存在（异步，在服务器启动时调用）
@@ -64,10 +82,12 @@ async function ensureAgentDirectory() {
         }
     }
 }
-const TVS_DIR = path.join(__dirname, 'TVStxt'); // 新增：定义 TVStxt 目录
+const TVS_DIR = resolveTvsDir();
+const MULTIMEDIA_PRESETS_DIR = resolveMultimediaPresetsDir();
 const crypto = require('crypto');
 const agentManager = require('./modules/agentManager.js'); // 新增：Agent管理器
 const tvsManager = require('./modules/tvsManager.js'); // 新增：TVS管理器
+const multimediaPresetManager = require('./modules/multimediaPresetManager.js'); // 新增：多模态预设管理器
 const messageProcessor = require('./modules/messageProcessor.js');
 const knowledgeBaseManager = require('./KnowledgeBaseManager.js'); // 新增：引入统一知识库管理器
 const pluginManager = require('./Plugin.js');
@@ -1007,7 +1027,8 @@ const adminPanelRoutes = require('./routes/adminPanelRoutes')(
     pluginManager,
     logger.getServerLogPath, // Pass the getter function
     knowledgeBaseManager, // Pass the knowledgeBaseManager instance
-    AGENT_DIR // Pass the Agent directory path
+    AGENT_DIR, // Pass the Agent directory path
+    TVS_DIR // Pass the TVS directory path
 );
 
 // 新增：引入 VCP 论坛 API 路由
@@ -1194,8 +1215,14 @@ async function startServer() {
     console.log('Agent管理器初始化完成。');
 
     console.log('正在初始化TVS管理器...');
+    tvsManager.setTvsDir(TVS_DIR);
     tvsManager.initialize(DEBUG_MODE);
-    console.log('TVS管理器初始化完成。');
+    console.log(`TVS管理器初始化完成。目录: ${TVS_DIR}`);
+
+    console.log('正在初始化多模态预设管理器...');
+    multimediaPresetManager.setPresetsDir(MULTIMEDIA_PRESETS_DIR);
+    await multimediaPresetManager.initialize(DEBUG_MODE);
+    console.log(`多模态预设管理器初始化完成。目录: ${MULTIMEDIA_PRESETS_DIR}`);
 
     // 🌟 关键修复：在监听端口前完成所有初始化
     await initialize(); // This loads plugins and initializes services

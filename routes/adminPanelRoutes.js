@@ -14,14 +14,16 @@ const blockedManifestExtension = '.block';
 // 记录每个日志文件的 inode，用于检测日志轮转
 const logFileInodes = new Map();
 
-module.exports = function(DEBUG_MODE, dailyNoteRootPath, pluginManager, getCurrentServerLogPath, vectorDBManager, agentDirPath) {
+module.exports = function(DEBUG_MODE, dailyNoteRootPath, pluginManager, getCurrentServerLogPath, vectorDBManager, agentDirPath, tvsDirPath) {
     if (!agentDirPath || typeof agentDirPath !== 'string') {
         throw new Error('[AdminPanelRoutes] agentDirPath must be a non-empty string');
     }
     
     const adminApiRouter = express.Router();
     const AGENT_FILES_DIR = agentDirPath;
+    const TVS_FILES_DIR = tvsDirPath || path.join(__dirname, '..', 'TVStxt');
     console.log('[AdminPanelRoutes] Agent files directory:', AGENT_FILES_DIR);
+    console.log('[AdminPanelRoutes] TVS files directory:', TVS_FILES_DIR);
 
   
 
@@ -994,7 +996,6 @@ module.exports = function(DEBUG_MODE, dailyNoteRootPath, pluginManager, getCurre
     // --- End Agent Files API ---
 
     // --- TVS Variable Files API ---
-    const TVS_FILES_DIR = path.join(__dirname, '..', 'TVStxt'); // 定义 TVS 文件目录
 
     // GET list of TVS .txt files
     adminApiRouter.get('/tvsvars', async (req, res) => {
@@ -1772,8 +1773,7 @@ module.exports = function(DEBUG_MODE, dailyNoteRootPath, pluginManager, getCurre
     adminApiRouter.get('/tool-list-editor/check-file/:fileName', async (req, res) => {
         try {
             const fileName = req.params.fileName;
-            const tvsTxtDir = path.join(PROJECT_BASE_PATH, 'TVStxt');
-            const outputPath = path.join(tvsTxtDir, `${fileName}.txt`);
+            const outputPath = path.join(TVS_FILES_DIR, `${fileName}.txt`);
             
             try {
                 await fs.access(outputPath);
@@ -1793,8 +1793,7 @@ module.exports = function(DEBUG_MODE, dailyNoteRootPath, pluginManager, getCurre
     adminApiRouter.post('/tool-list-editor/export/:fileName', async (req, res) => {
         try {
             const fileName = req.params.fileName;
-            const tvsTxtDir = path.join(PROJECT_BASE_PATH, 'TVStxt');
-            const outputPath = path.join(tvsTxtDir, `${fileName}.txt`);
+            const outputPath = path.join(TVS_FILES_DIR, `${fileName}.txt`);
             
             const { selectedTools, toolDescriptions, includeHeader, includeExamples } = req.body;
             

@@ -442,6 +442,95 @@ class ChatCompletionHandler {
           return newMessage;
         }),
       );
+
+      // --- 多模态 ContentParts 标记解析 ---
+      // 将 {{XX日记本::ShowBase64}} 等返回的标记字符串转换为真正的多模态消息格式
+      // 关键：大多数 LLM API 不支持 system 消息中的 image_url parts，
+      // 因此需要将 image_url parts 拆分到紧随其后的 user 消息中
+      {
+        // 检测是否存在多模态标记 — 如果存在，禁用媒体处理器（避免 ImageProcessor 转译我们的图片）
+        const hasMultimodalMarkers = processedMessages.some(
+          msg => typeof msg.content === 'string' && msg.content.includes('<<<[MULTIMODAL_CONTENT_PARTS]>>>')
+        );
+        if (hasMultimodalMarkers) {
+          shouldProcessMedia = false;
+          if (DEBUG_MODE) console.log('[MultimodalParts] Detected multimodal content markers, disabling media processor to preserve raw image data');
+        }
+
+        const expandedMessages = [];
+        for (const msg of processedMessages) {
+          if (typeof msg.content === 'string' && msg.content.includes('<<<[MULTIMODAL_CONTENT_PARTS]>>>')) {
+            const markerRegex = /<<<\[MULTIMODAL_CONTENT_PARTS\]>>>([\s\S]*?)<<<\[END_MULTIMODAL_CONTENT_PARTS\]>>>/g;
+            const parts = [];
+            let lastIndex = 0;
+            let match;
+
+            while ((match = markerRegex.exec(msg.content)) !== null) {
+              const before = msg.content.slice(lastIndex, match.index).trim();
+              if (before) {
+                parts.push({ type: 'text', text: before });
+              }
+              try {
+                const contentParts = JSON.parse(match[1]);
+                if (Array.isArray(contentParts)) {
+                  parts.push(...contentParts);
+                }
+              } catch (e) {
+                console.error('[MultimodalParts] Failed to parse content parts JSON:', e.message);
+                parts.push({ type: 'text', text: match[1] });
+              }
+              lastIndex = match.index + match[0].length;
+            }
+
+            const after = msg.content.slice(lastIndex).trim();
+            if (after) {
+              parts.push({ type: 'text', text: after });
+            }
+
+            if (parts.length > 0) {
+              // 检查是否有 image_url parts 在非 user 消息中（system/assistant）
+              const hasImageParts = parts.some(p => p.type === 'image_url');
+              if (hasImageParts && msg.role !== 'user') {
+                // 拆分：text parts 留在原消息，image_url parts 移到新 user 消息
+                const textParts = parts.filter(p => p.type === 'text');
+                const imageParts = parts.filter(p => p.type === 'image_url');
+
+                // 原消息保留纯文本
+                if (textParts.length === 1) {
+                  expandedMessages.push({ ...msg, content: textParts[0].text });
+                } else if (textParts.length > 1) {
+                  expandedMessages.push({ ...msg, content: textParts.map(p => p.text).join('\n\n') });
+                } else {
+                  // 没有文本，保留空消息可能有问题，跳过原消息
+                  // 但为安全起见还是保留
+                  expandedMessages.push({ ...msg, content: '' });
+                }
+
+                // 新建 user 消息承载 image_url parts
+                // 附带一个简短的文本说明，帮助模型理解上下文
+                const imageUserParts = [
+                  { type: 'text', text: '[以下是系统提供的多模态文件内容]' },
+                  ...imageParts
+                ];
+                expandedMessages.push({ role: 'user', content: imageUserParts });
+
+                if (DEBUG_MODE) {
+                  console.log(`[MultimodalParts] Split ${imageParts.length} image_url parts from ${msg.role} message to new user message`);
+                }
+              } else {
+                // user 消息或无 image parts，直接设置 content 为数组
+                expandedMessages.push({ ...msg, content: parts });
+              }
+            } else {
+              expandedMessages.push(msg);
+            }
+          } else {
+            expandedMessages.push(msg);
+          }
+        }
+        processedMessages = expandedMessages;
+      }
+
       if (DEBUG_MODE) await writeDebugLog('LogAfterVariableProcessing', processedMessages);
 
       // --- 媒体处理器 ---

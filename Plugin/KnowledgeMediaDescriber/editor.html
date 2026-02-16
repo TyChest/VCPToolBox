@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多模态文件描述编辑器</title>
+<style>
+:root { --bg: #1a1a2e; --bg-light: #16213e; --border: #0f3460; --text: #e0e0e0; --accent: #e94560; --text-dim: #888; --success-bg: #2d6a4f; --success-text: #b7e4c7; --error-bg: #6c3a3a; --error-text: #e0a0a0; }
+[data-theme="light"] { --bg: #f5f5f5; --bg-light: #ffffff; --border: #ddd; --text: #333; --accent: #e94560; --text-dim: #666; --success-bg: #d4edda; --success-text: #155724; --error-bg: #f8d7da; --error-text: #721c24; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+.header { background: var(--bg-light); padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+.header h1 { font-size: 16px; color: var(--accent); }
+.header .subtitle { font-size: 12px; color: var(--text-dim); }
+.main { display: flex; flex: 1; overflow: hidden; }
+.sidebar { width: 280px; background: var(--bg-light); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+.sidebar-header { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600; color: var(--accent); }
+.diary-list, .file-list { flex: 1; overflow-y: auto; }
+.diary-item, .file-item { padding: 8px 12px; cursor: pointer; font-size: 13px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+.diary-item:hover, .file-item:hover { background: var(--border); }
+.diary-item.active, .file-item.active { background: color-mix(in srgb, var(--accent) 15%, transparent); border-left: 3px solid var(--accent); }
+.file-icon { font-size: 16px; flex-shrink: 0; }
+.file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-status { font-size: 10px; padding: 2px 6px; border-radius: 3px; flex-shrink: 0; }
+.file-status.has-desc { background: var(--success-bg); color: var(--success-text); }
+.file-status.no-desc { background: var(--error-bg); color: var(--error-text); }
+.editor-panel { flex: 1; display: flex; flex-direction: column; padding: 16px; gap: 12px; overflow-y: auto; }
+.preview-area { text-align: center; padding: 16px; background: var(--bg-light); border-radius: 8px; min-height: 200px; display: flex; align-items: center; justify-content: center; }
+.preview-area img { max-width: 100%; max-height: 300px; border-radius: 4px; }
+.preview-placeholder { color: var(--text-dim); font-size: 14px; }
+.form-group { display: flex; flex-direction: column; gap: 4px; }
+.form-group label { font-size: 12px; color: var(--text-dim); font-weight: 600; }
+.form-group input, .form-group textarea, .form-group select { background: var(--bg-light); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 4px; font-size: 13px; font-family: inherit; }
+.form-group textarea { resize: vertical; min-height: 120px; }
+.form-group input:focus, .form-group textarea:focus, .form-group select:focus { outline: none; border-color: var(--accent); }
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; transition: opacity 0.2s; }
+.btn:hover { opacity: 0.85; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-primary { background: var(--accent); color: white; }
+.btn-secondary { background: var(--border); color: var(--text); }
+.btn-danger { background: var(--error-bg); color: var(--error-text); }
+.toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 20px; border-radius: 6px; font-size: 13px; z-index: 999; animation: fadeIn 0.3s; }
+.toast.success { background: var(--success-bg); color: var(--success-text); }
+.toast.error { background: var(--error-bg); color: var(--error-text); }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+.empty-state { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-dim); font-size: 14px; }
+.loading { color: var(--text-dim); font-size: 13px; padding: 12px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>📸 多模态文件描述编辑器</h1>
+  <span class="subtitle">KnowledgeMediaDescriber v1.0</span>
+</div>
+<div class="main">
+  <div class="sidebar">
+    <div class="sidebar-header">📁 日记本目录</div>
+    <div class="diary-list" id="diaryList"><div class="loading">加载中...</div></div>
+    <div class="sidebar-header">📄 文件列表</div>
+    <div class="file-list" id="fileList"><div class="empty-state">请选择日记本</div></div>
+  </div>
+  <div class="editor-panel" id="editorPanel">
+    <div class="empty-state" id="emptyState">请从左侧选择一个多模态文件进行编辑</div>
+    <div id="editorContent" style="display:none;">
+      <div class="preview-area" id="previewArea">
+        <span class="preview-placeholder">预览区域</span>
+      </div>
+      <div class="form-group">
+        <label>预设名称</label>
+        <select id="presetSelect"><option value="PresetDefault">PresetDefault</option></select>
+      </div>
+      <div class="form-group">
+        <label>描述信息</label>
+        <textarea id="descText" placeholder="输入文件描述..."></textarea>
+      </div>
+      <div class="form-group">
+        <label>标签 (Tag)</label>
+        <input type="text" id="tagsInput" placeholder="tag1, tag2, tag3">
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btnSave" onclick="saveDescription()">💾 保存</button>
+        <button class="btn btn-secondary" id="btnRecognize" onclick="triggerRecognize()">🤖 AI 识别</button>
+        <button class="btn btn-secondary" id="btnRecognizeForce" onclick="triggerRecognize(true)">🔄 强制重新识别</button>
+        <button class="btn btn-danger" id="btnClear" onclick="clearDescription()">🗑️ 清除描述</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+// 主题同步：监听父窗口主题变化
+window.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'themeChange') {
+    document.documentElement.setAttribute('data-theme', event.data.theme);
+  }
+});
+window.addEventListener('DOMContentLoaded', () => {
+  if (window.parent && window.parent !== window) {
+    window.parent.postMessage({ type: 'requestTheme' }, '*');
+  }
+});
+
+const API_BASE = '/admin_api/media-describer';
+let currentDiary = null;
+let currentFile = null;
+
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(API_BASE + path, opts);
+  return res.json();
+}
+
+function toast(msg, type = 'success') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+function getFileIcon(type) {
+  const icons = { image: '🖼️', video: '🎬', audio: '🎵', pdf: '📄', text: '📝', unknown: '📎' };
+  return icons[type] || '📎';
+}
+
+async function loadDiaries() {
+  const data = await api('GET', '/diaries');
+  const el = document.getElementById('diaryList');
+  if (!data.success || !data.diaries.length) { el.innerHTML = '<div class="empty-state">无日记本目录</div>'; return; }
+  el.innerHTML = data.diaries.map(d =>
+    `<div class="diary-item" onclick="selectDiary('${d}')" data-name="${d}">📁 ${d}</div>`
+  ).join('');
+}
+
+async function selectDiary(name) {
+  currentDiary = name;
+  currentFile = null;
+  document.querySelectorAll('.diary-item').forEach(el => el.classList.toggle('active', el.dataset.name === name));
+  document.getElementById('fileList').innerHTML = '<div class="loading">加载中...</div>';
+  hideEditor();
+
+  const data = await api('GET', '/files/' + encodeURIComponent(name));
+  const el = document.getElementById('fileList');
+  if (!data.success || !data.files.length) { el.innerHTML = '<div class="empty-state">无文件</div>'; return; }
+
+  el.innerHTML = data.files.map(f => {
+    const statusClass = f.type === 'text' ? '' : (f.hasDescription ? 'has-desc' : 'no-desc');
+    const statusText = f.type === 'text' ? '' : (f.hasDescription ? '已描述' : '未描述');
+    return `<div class="file-item" onclick="selectFile('${f.name}')" data-name="${f.name}">
+      <span class="file-icon">${getFileIcon(f.type)}</span>
+      <span class="file-name">${f.name}</span>
+      ${statusText ? `<span class="file-status ${statusClass}">${statusText}</span>` : ''}
+    </div>`;
+  }).join('');
+}
+
+async function selectFile(name) {
+  currentFile = name;
+  document.querySelectorAll('.file-item').forEach(el => el.classList.toggle('active', el.dataset.name === name));
+
+  const ext = name.split('.').pop().toLowerCase();
+  const isText = ['txt', 'md'].includes(ext);
+  if (isText) { hideEditor(); toast('文本文件无需描述信息', 'error'); return; }
+
+  showEditor();
+  await loadPresets();
+  await loadPreview();
+  await loadDescription();
+}
+
+async function loadPresets() {
+  const data = await api('GET', '/presets');
+  const sel = document.getElementById('presetSelect');
+  if (data.success && data.presets) {
+    sel.innerHTML = data.presets.map(p => `<option value="${p}">${p}</option>`).join('');
+  }
+}
+
+async function loadPreview() {
+  const area = document.getElementById('previewArea');
+  const ext = currentFile.split('.').pop().toLowerCase();
+  if (['png','jpg','jpeg','gif','webp','bmp','svg'].includes(ext)) {
+    area.innerHTML = `<img src="${API_BASE}/thumbnail/${encodeURIComponent(currentDiary)}/${encodeURIComponent(currentFile)}" alt="${currentFile}">`;
+  } else {
+    area.innerHTML = `<span class="preview-placeholder">${getFileIcon(getFileType(ext))} ${currentFile}</span>`;
+  }
+}
+
+function getFileType(ext) {
+  if (['png','jpg','jpeg','gif','webp','bmp','svg','ico','tiff','tif','avif'].includes(ext)) return 'image';
+  if (['mp4','avi','mov','mkv','webm','flv'].includes(ext)) return 'video';
+  if (['mp3','wav','ogg','flac','aac','m4a'].includes(ext)) return 'audio';
+  if (ext === 'pdf') return 'pdf';
+  return 'unknown';
+}
+
+async function loadDescription() {
+  const data = await api('GET', `/desc/${encodeURIComponent(currentDiary)}/${encodeURIComponent(currentFile)}`);
+  if (data.success && data.description) {
+    document.getElementById('presetSelect').value = data.description.presetName || 'PresetDefault';
+    document.getElementById('descText').value = data.description.description || '';
+    document.getElementById('tagsInput').value = data.description.tags || '';
+  } else {
+    document.getElementById('presetSelect').value = 'PresetDefault';
+    document.getElementById('descText').value = '';
+    document.getElementById('tagsInput').value = '';
+  }
+}
+
+async function saveDescription() {
+  if (!currentDiary || !currentFile) return;
+  const body = {
+    presetName: document.getElementById('presetSelect').value,
+    description: document.getElementById('descText').value,
+    tags: document.getElementById('tagsInput').value
+  };
+  const data = await api('PUT', `/desc/${encodeURIComponent(currentDiary)}/${encodeURIComponent(currentFile)}`, body);
+  if (data.success) {
+    toast('保存成功');
+    selectDiary(currentDiary); // 刷新文件列表状态
+  } else {
+    toast('保存失败: ' + data.error, 'error');
+  }
+}
+
+async function triggerRecognize(force = false) {
+  if (!currentDiary || !currentFile) return;
+  const preset = document.getElementById('presetSelect').value;
+  const btn = force ? document.getElementById('btnRecognizeForce') : document.getElementById('btnRecognize');
+  btn.disabled = true;
+  btn.textContent = '识别中...';
+  try {
+    const data = await api('POST', `/recognize/${encodeURIComponent(currentDiary)}/${encodeURIComponent(currentFile)}?preset=${preset}&force=${force}`);
+    if (data.success && data.description) {
+      document.getElementById('descText').value = data.description.description || '';
+      document.getElementById('tagsInput').value = data.description.tags || '';
+      document.getElementById('presetSelect').value = data.description.presetName || preset;
+      toast('AI 识别完成');
+      selectDiary(currentDiary);
+    } else {
+      toast('识别失败: ' + (data.error || '未知错误'), 'error');
+    }
+  } catch (e) {
+    toast('识别请求失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = force ? '🔄 强制重新识别' : '🤖 AI 识别';
+  }
+}
+
+async function clearDescription() {
+  if (!currentDiary || !currentFile) return;
+  if (!confirm('确定要清除该文件的描述信息吗？')) return;
+  const body = { presetName: '', description: '', tags: '' };
+  const data = await api('PUT', `/desc/${encodeURIComponent(currentDiary)}/${encodeURIComponent(currentFile)}`, body);
+  if (data.success) {
+    document.getElementById('descText').value = '';
+    document.getElementById('tagsInput').value = '';
+    toast('描述已清除');
+    selectDiary(currentDiary);
+  }
+}
+
+function showEditor() {
+  document.getElementById('emptyState').style.display = 'none';
+  document.getElementById('editorContent').style.display = 'block';
+}
+function hideEditor() {
+  document.getElementById('emptyState').style.display = 'flex';
+  document.getElementById('editorContent').style.display = 'none';
+}
+
+loadDiaries();
+</script>
+</body>
+</html>

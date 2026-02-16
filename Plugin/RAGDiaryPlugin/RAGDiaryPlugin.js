@@ -13,6 +13,10 @@ const SemanticGroupManager = require('./SemanticGroupManager.js');
 const AIMemoHandler = require('./AIMemoHandler.js'); // <--- 新增：引入AIMemoHandler
 const ContextVectorManager = require('./ContextVectorManager.js'); // <--- 新增：引入上下文向量管理器
 const { chunkText } = require('../../TextChunker.js'); // <--- 新增：引入文本分块器
+const { parseMultimodalParams, hasMultimodalMode } = require('../../modules/multimodalSyntaxParser.js'); // 多模态语法解析
+const mediaDescriptionManager = require('../../modules/mediaDescriptionManager.js'); // 多模态描述信息管理
+const multimediaRecognizer = require('../../modules/multimediaRecognizer.js'); // 多模态识别
+const messageProcessor = require('../../modules/messageProcessor.js'); // 分层解析方法
 
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
@@ -388,36 +392,205 @@ class RAGDiaryPlugin {
         return result;
     }
 
-    async getDiaryContent(characterName) {
+    async getDiaryContent(characterName, multimodalParams = null) {
         const characterDirPath = path.join(dailyNoteRootPath, characterName);
         let characterDiaryContent = `[${characterName}日记本内容为空]`;
         try {
-            const files = await fs.readdir(characterDirPath);
-            const relevantFiles = files.filter(file => {
-                const lowerCaseFile = file.toLowerCase();
-                return lowerCaseFile.endsWith('.txt') || lowerCaseFile.endsWith('.md');
-            }).sort();
+            const { textFiles, multimediaFiles } = await mediaDescriptionManager.scanDirectory(characterDirPath);
 
-            if (relevantFiles.length > 0) {
-                const fileContents = await Promise.all(
-                    relevantFiles.map(async (file) => {
-                        const filePath = path.join(characterDirPath, file);
-                        try {
-                            return await fs.readFile(filePath, 'utf-8');
-                        } catch (readErr) {
-                            return `[Error reading file: ${file}]`;
-                        }
-                    })
+            // 1. 读取文本文件（原有逻辑，除非 :NoText）
+            if (!multimodalParams?.flags?.noText) {
+                // 如果指定了特定文本文件
+                const specifiedTextFiles = multimodalParams?.specifiedFiles?.filter(f => {
+                    const ext = path.extname(f).toLowerCase();
+                    return ext === '.txt' || ext === '.md';
+                }) || [];
+                const textSrc = specifiedTextFiles.length > 0 ? specifiedTextFiles : textFiles;
+
+                if (textSrc.length > 0) {
+                    const fileContents = await Promise.all(
+                        textSrc.map(async (file) => {
+                            const filePath = path.join(characterDirPath, file);
+                            try {
+                                return await fs.readFile(filePath, 'utf-8');
+                            } catch (readErr) {
+                                return `[Error reading file: ${file}]`;
+                            }
+                        })
+                    );
+                    characterDiaryContent = fileContents.join('\n\n---\n\n');
+                }
+            } else {
+                characterDiaryContent = ''; // NoText 模式不读取文本
+            }
+
+            // 2. 若有多模态参数，处理多模态文件
+            if (multimodalParams?.mode && multimediaFiles.length > 0) {
+                const targets = multimodalParams.specifiedFiles?.length > 0
+                    ? multimediaFiles.filter(f => multimodalParams.specifiedFiles.includes(f))
+                    : multimediaFiles;
+
+                const multimodalResult = await this._assembleMultimodalContent(
+                    characterDirPath, targets, multimodalParams
                 );
-                characterDiaryContent = fileContents.join('\n\n---\n\n');
+
+                if (typeof multimodalResult === 'string') {
+                    // OverBase64 模式：纯文本
+                    if (characterDiaryContent && multimodalResult) {
+                        characterDiaryContent += '\n\n' + multimodalResult;
+                    } else if (multimodalResult) {
+                        characterDiaryContent = multimodalResult;
+                    }
+                } else if (Array.isArray(multimodalResult)) {
+                    // ShowBase64/ShowBase64+ 模式：ContentPart 数组
+                    // 返回特殊标记，由上层处理
+                    const textPart = characterDiaryContent || '';
+                    return `<<<[MULTIMODAL_CONTENT_PARTS]>>>${JSON.stringify([
+                        ...(textPart ? [{ type: 'text', text: textPart }] : []),
+                        ...multimodalResult
+                    ])}<<<[END_MULTIMODAL_CONTENT_PARTS]>>>`;
+                }
+            } else if (!multimodalParams?.mode && multimediaFiles.length > 0) {
+                // 无多模态参数时，附加已有描述信息
+                const descTexts = [];
+                for (const mf of multimediaFiles) {
+                    const filePath = path.join(characterDirPath, mf);
+                    const desc = await mediaDescriptionManager.readDescription(filePath);
+                    if (desc?.description) {
+                        const rendered = mediaDescriptionManager.renderDescription(filePath, desc);
+                        if (rendered) descTexts.push(rendered);
+                    }
+                }
+                if (descTexts.length > 0) {
+                    characterDiaryContent += '\n\n' + descTexts.join('\n\n');
+                }
             }
         } catch (charDirError) {
             if (charDirError.code !== 'ENOENT') {
                 console.error(`[RAGDiaryPlugin] Error reading character directory ${characterDirPath}:`, charDirError.message);
             }
-            characterDiaryContent = `[无法读取“${characterName}”的日记本，可能不存在]`;
+            characterDiaryContent = `[无法读取"${characterName}"的日记本，可能不存在]`;
         }
         return characterDiaryContent;
+    }
+
+    /**
+     * 组装多模态内容
+     * @param {string} dirPath - 日记本目录路径
+     * @param {string[]} targets - 目标多模态文件列表
+     * @param {object} params - 解析后的多模态参数
+     * @returns {string|Array} 文本或 ContentPart 数组
+     */
+    async _assembleMultimodalContent(dirPath, targets, params) {
+        switch (params.mode) {
+            case 'OverBase64': {
+                const parts = [];
+                for (const mf of targets) {
+                    const filePath = path.join(dirPath, mf);
+                    let desc = await mediaDescriptionManager.readDescription(filePath);
+                    if ((!desc || !desc.description) || params.flags.noCaching) {
+                        desc = await multimediaRecognizer.recognizeAndDescribe(
+                            filePath, params.presetName, params.flags.noCaching
+                        );
+                    }
+                    if (desc) {
+                        const rendered = params.flags.tagOnly
+                            ? mediaDescriptionManager.renderTagOnly(filePath, desc)
+                            : mediaDescriptionManager.renderDescription(filePath, desc);
+                        if (rendered) parts.push(rendered);
+                    }
+                }
+                return parts.join('\n\n');
+            }
+
+            case 'ShowBase64': {
+                const contentParts = [];
+                for (const mf of targets) {
+                    const filePath = path.join(dirPath, mf);
+                    if (mediaDescriptionManager.isBase64Sendable(mf)) {
+                        contentParts.push(await mediaDescriptionManager.buildImageContentPart(filePath));
+                    }
+                }
+                return contentParts;
+            }
+
+            case 'ShowBase64+': {
+                const contentParts = [];
+                for (const mf of targets) {
+                    const filePath = path.join(dirPath, mf);
+                    let desc = await mediaDescriptionManager.readDescription(filePath);
+                    if ((!desc || !desc.description) || params.flags.noCaching) {
+                        desc = await multimediaRecognizer.recognizeAndDescribe(
+                            filePath, params.presetName, params.flags.noCaching
+                        );
+                    }
+                    if (desc) {
+                        const rendered = params.flags.tagOnly
+                            ? mediaDescriptionManager.renderTagOnly(filePath, desc)
+                            : mediaDescriptionManager.renderDescription(filePath, desc);
+                        if (rendered) contentParts.push({ type: 'text', text: rendered });
+                    }
+                    if (mediaDescriptionManager.isBase64Sendable(mf)) {
+                        contentParts.push(await mediaDescriptionManager.buildImageContentPart(filePath));
+                    }
+                }
+                return contentParts;
+            }
+
+            default:
+                return '';
+        }
+    }
+
+    /**
+     * 对召回内容执行多次解析（resolveLevel 后处理）
+     * @param {string} content - 召回的内容
+     * @param {object} parsed - 解析后的多模态参数（含 resolveLevel, resolveDepth）
+     * @param {object} context - 上下文信息（model 等）
+     * @returns {string} 解析后的内容
+     */
+    async _applyResolveLevel(content, parsed, context) {
+        if (!parsed.resolveLevel) return content;
+
+        const depth = parsed.resolveDepth || 1;
+        let result = content;
+
+        for (let i = 0; i < depth; i++) {
+            const level = parsed.resolveLevel.toLowerCase();
+            switch (level) {
+                case 'sar':
+                    result = await messageProcessor.replaceSarVariables(result, context.model, context);
+                    break;
+                case 'var':
+                    result = await messageProcessor.replaceVarVariables(result, context.model, context);
+                    break;
+                case 'tar':
+                    result = await messageProcessor.replaceTarVariables(result, context.model, context);
+                    break;
+                case 'metathought':
+                    // 扫描元思考标记并再次处理
+                    if (this.metaThinkingManager && /\[\[VCP元思考.*?\]\]/.test(result)) {
+                        try {
+                            const metaMatches = [...result.matchAll(/\[\[VCP元思考(.*?)\]\]/g)];
+                            for (const mm of metaMatches) {
+                                const metaResult = await this.metaThinkingManager.processMetaThinkingChain(
+                                    'default', context.queryVector, context.userContent, context.aiContent,
+                                    context.combinedQueryForDisplay, null, false, false, 0.65
+                                );
+                                result = result.replace(mm[0], metaResult);
+                            }
+                        } catch (e) {
+                            console.warn(`[RAGDiaryPlugin] MetaThought 再解析失败:`, e.message);
+                        }
+                    }
+                    break;
+                default:
+                    // 视为 AgentName，调用完整解析链
+                    result = await messageProcessor.resolveAllVariables(result, context);
+                    break;
+            }
+        }
+        return result;
     }
 
     _sigmoid(x) {
@@ -863,12 +1036,21 @@ class RAGDiaryPlugin {
             // V3.0: 支持多system消息处理
             // 1. 识别所有需要处理的 system 消息（包括日记本、元思考和全局AIMemo开关）
             let isAIMemoLicensed = false; // <--- AIMemo许可证 [[AIMemo=True]] 检测标志
+            let isAIMemoBeyondText = false; // <--- AIMemoBeyondText许可证检测标志
             const targetSystemMessageIndices = messages.reduce((acc, m, index) => {
                 if (m.role === 'system' && typeof m.content === 'string') {
                     // 检查全局 AIMemo 开关
                     if (m.content.includes('[[AIMemo=True]]')) {
                         isAIMemoLicensed = true;
                         console.log('[RAGDiaryPlugin] AIMemo license [[AIMemo=True]] detected. ::AIMemo modifier is now active.');
+                    }
+                    // 检查 AIMemoBeyondText 开关
+                    if (m.content.includes('[[AIMemoBeyondText=True]]')) {
+                        isAIMemoBeyondText = true;
+                        console.log('[RAGDiaryPlugin] AIMemoBeyondText license detected. AIMemo will include multimodal files.');
+                        if (this.aiMemoHandler) {
+                            this.aiMemoHandler.beyondTextEnabled = true;
+                        }
                     }
 
                     // 检查 RAG/Meta/AIMemo 占位符
@@ -1041,6 +1223,7 @@ class RAGDiaryPlugin {
 
         // 移除全局 AIMemo 开关占位符，因为它只作为许可证，不应出现在最终输出中
         processedContent = processedContent.replace(/\[\[AIMemo=True\]\]/g, '');
+        processedContent = processedContent.replace(/\[\[AIMemoBeyondText=True\]\]/g, '');
 
         const ragDeclarations = [...processedContent.matchAll(/\[\[(.*?)日记本(.*?)\]\]/g)];
         const fullTextDeclarations = [...processedContent.matchAll(/<<(.*?)日记本>>/g)];
@@ -1254,7 +1437,9 @@ class RAGDiaryPlugin {
                 const finalSimilarity = Math.max(baseSimilarity, enhancedSimilarity);
 
                 if (finalSimilarity >= localThreshold) {
-                    const diaryContent = await this.getDiaryContent(dbName);
+                    // 解析多模态参数（<<>>全文模式也支持多模态参数）
+                    const fullTextMultimodalParams = null; // <<>> 基础模式暂不支持多模态参数
+                    const diaryContent = await this.getDiaryContent(dbName, fullTextMultimodalParams);
                     const safeContent = diaryContent
                         .replace(/\[\[.*日记本.*\]\]/g, '[循环占位符已移除]')
                         .replace(/<<.*日记本>>/g, '[循环占位符已移除]')
