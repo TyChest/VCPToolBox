@@ -368,15 +368,20 @@ async function _processMultimodalDiary(characterName, parsed, textContent, debug
 
                 // 空描述 → AI 识别
                 if ((!desc || !desc.description) || parsed.flags.noCaching) {
+                    // 如果指定了多个预设，取第一个进行识别；如果为 All，则使用 PresetDefault
+                    let recognitionPreset = parsed.presetNames[0];
+                    if (!recognitionPreset || recognitionPreset.toLowerCase() === 'all') {
+                        recognitionPreset = 'PresetDefault';
+                    }
                     desc = await multimediaRecognizer.recognizeAndDescribe(
-                        filePath, parsed.presetName, parsed.flags.noCaching
+                        filePath, recognitionPreset, parsed.flags.noCaching
                     );
                 }
 
                 if (desc) {
                     const rendered = parsed.flags.tagOnly
-                        ? mediaDescriptionManager.renderTagOnly(filePath, desc)
-                        : mediaDescriptionManager.renderDescription(filePath, desc);
+                        ? mediaDescriptionManager.renderTagOnly(filePath, desc, parsed.flags.hideFilePath)
+                        : mediaDescriptionManager.renderDescription(filePath, desc, parsed.presetNames, parsed.flags.hideFilePath);
                     if (rendered) parts.push(rendered);
                 }
             }
@@ -399,7 +404,11 @@ async function _processMultimodalDiary(characterName, parsed, textContent, debug
             for (const mf of targets) {
                 const filePath = path.join(dirPath, mf);
                 if (mediaDescriptionManager.isBase64Sendable(mf)) {
-                    contentParts.push(await mediaDescriptionManager.buildImageContentPart(filePath));
+                    const part = await mediaDescriptionManager.buildImageContentPart(filePath);
+                    if (parsed.flags.hideFilePath) {
+                        part.image_url.hideFilePath = true;
+                    }
+                    contentParts.push(part);
                 }
             }
 
@@ -425,22 +434,30 @@ async function _processMultimodalDiary(characterName, parsed, textContent, debug
 
                 // 空描述 → AI 识别
                 if ((!desc || !desc.description) || parsed.flags.noCaching) {
+                    let recognitionPreset = parsed.presetNames[0];
+                    if (!recognitionPreset || recognitionPreset.toLowerCase() === 'all') {
+                        recognitionPreset = 'PresetDefault';
+                    }
                     desc = await multimediaRecognizer.recognizeAndDescribe(
-                        filePath, parsed.presetName, parsed.flags.noCaching
+                        filePath, recognitionPreset, parsed.flags.noCaching
                     );
                 }
 
                 // 添加描述文本
                 if (desc) {
                     const rendered = parsed.flags.tagOnly
-                        ? mediaDescriptionManager.renderTagOnly(filePath, desc)
-                        : mediaDescriptionManager.renderDescription(filePath, desc);
+                        ? mediaDescriptionManager.renderTagOnly(filePath, desc, parsed.flags.hideFilePath)
+                        : mediaDescriptionManager.renderDescription(filePath, desc, parsed.presetNames, parsed.flags.hideFilePath);
                     if (rendered) contentParts.push({ type: 'text', text: rendered });
                 }
 
                 // 添加原始文件 Base64
                 if (mediaDescriptionManager.isBase64Sendable(mf)) {
-                    contentParts.push(await mediaDescriptionManager.buildImageContentPart(filePath));
+                    const part = await mediaDescriptionManager.buildImageContentPart(filePath);
+                    if (parsed.flags.hideFilePath) {
+                        part.image_url.hideFilePath = true;
+                    }
+                    contentParts.push(part);
                 }
             }
 
@@ -467,6 +484,7 @@ async function _getMultimediaDescriptionTexts(characterName) {
         const filePath = path.join(dirPath, mf);
         const desc = await mediaDescriptionManager.readDescription(filePath);
         if (desc && desc.description) {
+            // 默认附加模式不隐藏路径
             const rendered = mediaDescriptionManager.renderDescription(filePath, desc);
             if (rendered) descTexts.push(rendered);
         }

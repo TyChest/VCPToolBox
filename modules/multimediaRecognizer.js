@@ -12,21 +12,25 @@ class MultimediaRecognizer {
 
     /**
      * 对单个多模态文件进行 AI 识别并写入描述
+     * 支持分段写入：仅更新指定预设段落的内容
      * @param {string} filePath - 多模态文件完整路径
      * @param {string} presetName - 预设名称
-     * @param {boolean} forceOverwrite - 是否强制覆盖已有描述
+     * @param {boolean} forceOverwrite - 是否强制覆盖该预设段落的已有描述
      * @returns {object|null} 描述信息对象
      */
     async recognizeAndDescribe(filePath, presetName = 'PresetDefault', forceOverwrite = false) {
-        // 1. 检查是否已有描述
-        if (!forceOverwrite) {
-            const existing = await mediaDescriptionManager.readDescription(filePath);
-            if (existing && existing.description) {
-                if (this.debugMode) {
-                    console.log(`[MultimediaRecognizer] 已有描述，跳过: ${path.basename(filePath)}`);
-                }
-                return existing;
+        // 统一去掉预设名开头的 @ 符号
+        const cleanPresetName = presetName.startsWith('@') ? presetName.substring(1) : presetName;
+
+        // 1. 检查是否已有该预设的描述
+        const existing = await mediaDescriptionManager.readDescription(filePath);
+        const segments = mediaDescriptionManager.parseSegmentedDescription(existing?.description || '');
+        
+        if (!forceOverwrite && segments.has(cleanPresetName)) {
+            if (this.debugMode) {
+                console.log(`[MultimediaRecognizer] 预设 ${cleanPresetName} 已有描述，跳过: ${path.basename(filePath)}`);
             }
+            return existing;
         }
 
         // 2. 检查文件是否可以发送给 LLM
@@ -112,13 +116,26 @@ class MultimediaRecognizer {
             // 8. 从回复中提取描述和 Tag
             const { description, tags } = this._parseAIResponse(aiResponse);
 
-            // 9. 构建描述对象并写入侧车文件
+            // 9. 更新描述对象的分段内容并写入侧车文件
+            // 重新解析以防在识别期间文件被修改
+            const latestDesc = await mediaDescriptionManager.readDescription(filePath) || { description: '', tags: '', originalMetadata: {} };
+            const latestSegments = mediaDescriptionManager.parseSegmentedDescription(latestDesc.description);
+            
+            // 更新或添加当前预设段落
+            latestSegments.set(cleanPresetName, description);
+            
+            // 重新组装完整描述字符串
+            let fullDescription = '';
+            for (const [segName, content] of latestSegments) {
+                fullDescription += `[@${segName}:]\n${content}\n\n`;
+            }
+
             const descObj = {
-                presetName: preset.name || presetName,
-                description: description,
-                tags: tags,
-                modelUsed: model,
-                originalMetadata: {}
+                ...latestDesc,
+                description: fullDescription.trim(),
+                // 合并标签（去重）
+                tags: this._mergeTags(latestDesc.tags, tags),
+                modelUsed: model
             };
 
             await mediaDescriptionManager.writeDescription(filePath, descObj);
@@ -158,6 +175,20 @@ class MultimediaRecognizer {
         }
 
         return results;
+    }
+
+    /**
+     * 合并标签字符串
+     */
+    _mergeTags(oldTags, newTags) {
+        if (!newTags) return oldTags || '';
+        if (!oldTags) return newTags;
+        
+        const tagSet = new Set([
+            ...oldTags.split(',').map(t => t.trim()).filter(Boolean),
+            ...newTags.split(',').map(t => t.trim()).filter(Boolean)
+        ]);
+        return Array.from(tagSet).join(', ');
     }
 
     /**

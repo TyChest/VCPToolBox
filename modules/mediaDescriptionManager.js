@@ -108,8 +108,9 @@ class MediaDescriptionManager {
      */
     async writeDescription(filePath, descObj) {
         const descPath = this.getDescPath(filePath);
+        const { presetName, ...rest } = descObj; // 移除冗余的 presetName
         const data = {
-            ...descObj,
+            ...rest,
             updatedAt: new Date().toISOString()
         };
         if (!data.createdAt) {
@@ -153,41 +154,97 @@ class MediaDescriptionManager {
     }
 
     /**
-     * 渲染描述信息为文本格式（用于注入 System Prompt）
-     * 格式：
-     *   [PresetDefault]
-     *   描述正文...
-     *   [文件路径: /path/to/file.png]
-     *   Tag: tag1, tag2, tag3
+     * 解析分段描述信息
+     * @param {string} fullDescription - 包含 [@预设名:] 标记的完整描述字符串
+     * @returns {Map<string, string>} 预设名 -> 内容
      */
-    renderDescription(filePath, descObj) {
+    parseSegmentedDescription(fullDescription) {
+        const segments = new Map();
+        if (!fullDescription) return segments;
+
+        // 正则匹配 [@预设名:] 及其后的内容，直到下一个标记或结尾
+        const regex = /\[@([^\]]+):\]([\s\S]*?)(?=\[@[^\]]+:\]|$)/g;
+        let match;
+        let hasMatches = false;
+
+        while ((match = regex.exec(fullDescription)) !== null) {
+            hasMatches = true;
+            const presetName = match[1].trim();
+            const content = match[2].trim();
+            if (content) {
+                segments.set(presetName, content);
+            }
+        }
+
+        // 如果没有任何标记，则视为整个内容属于 "Native" 或 "Manual" (取决于上下文，这里暂存为 "Legacy")
+        if (!hasMatches && fullDescription.trim()) {
+            segments.set('Native', fullDescription.trim());
+        }
+
+        return segments;
+    }
+
+    /**
+     * 渲染描述信息为文本格式（用于注入 System Prompt）
+     * 支持分段选择
+     * @param {string} filePath - 文件路径
+     * @param {object} descObj - 描述对象
+     * @param {string[]} requestedPresets - 请求的预设列表，若为空或包含 'All' 则返回全部
+     * @param {boolean} hideFilePath - 是否隐藏文件路径
+     */
+    renderDescription(filePath, descObj, requestedPresets = [], hideFilePath = false) {
         if (!descObj || !descObj.description) return null;
 
-        let rendered = '';
-        // 第一行：预设名
-        if (descObj.presetName) {
-            rendered += `[${descObj.presetName}]\n`;
+        const segments = this.parseSegmentedDescription(descObj.description);
+        if (segments.size === 0) return null;
+
+        let renderedParts = [];
+        const isAll = requestedPresets.length === 0 || requestedPresets.some(p => p.toLowerCase() === 'all');
+
+        for (const [presetName, content] of segments) {
+            // 检查是否匹配请求的预设 (忽略开头的 @ 符号进行匹配)
+            const shouldInclude = isAll || requestedPresets.some(p => {
+                const cleanP = p.startsWith('@') ? p.substring(1) : p;
+                return cleanP.toLowerCase() === presetName.toLowerCase();
+            });
+            
+            if (shouldInclude) {
+                renderedParts.push(`[${presetName}]\n${content}`);
+            }
         }
-        // 描述正文
-        rendered += descObj.description.trim();
-        // 文件路径
-        rendered += `\n[文件路径: ${filePath}]`;
+
+        if (renderedParts.length === 0) return null;
+
+        let finalRendered = renderedParts.join('\n\n');
+        
+        // 文件路径/名称
+        if (hideFilePath) {
+            finalRendered += `\n[文件名: ${path.basename(filePath)}]`;
+        } else {
+            finalRendered += `\n[文件路径: ${filePath}]`;
+        }
+        
         // Tag 行
         if (descObj.tags && descObj.tags.trim()) {
-            rendered += `\nTag: ${descObj.tags.trim()}`;
+            finalRendered += `\nTag: ${descObj.tags.trim()}`;
         }
-        return rendered;
+        
+        return finalRendered;
     }
 
     /**
      * 仅渲染 Tag 行（用于 :TagOnly 模式）
      */
-    renderTagOnly(filePath, descObj) {
+    renderTagOnly(filePath, descObj, hideFilePath = false) {
         if (!descObj) return null;
         let rendered = '';
         if (descObj.tags && descObj.tags.trim()) {
             rendered += `Tag: ${descObj.tags.trim()}`;
-            rendered += `\n[文件路径: ${filePath}]`;
+            if (hideFilePath) {
+                rendered += `\n[文件名: ${path.basename(filePath)}]`;
+            } else {
+                rendered += `\n[文件路径: ${filePath}]`;
+            }
         }
         return rendered;
     }
@@ -248,7 +305,10 @@ class MediaDescriptionManager {
         const dataUri = await this.readAsBase64DataUri(filePath);
         return {
             type: 'image_url',
-            image_url: { url: dataUri }
+            image_url: {
+                url: dataUri,
+                filePath: filePath // 附加路径信息，供后续 introText 使用
+            }
         };
     }
 

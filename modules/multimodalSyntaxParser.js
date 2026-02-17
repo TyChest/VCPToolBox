@@ -34,10 +34,10 @@ function parseMultimodalParams(rawPlaceholder) {
 
     const result = {
         diaryName,
-        presetName: null,        // PresetName01
+        presetNames: [],         // [PresetName01, PresetName02]
         mode: null,              // OverBase64 | ShowBase64 | ShowBase64+
         specifiedFiles: [],      // logo.png;bar.png
-        flags: { noCaching: false, noText: false, tagOnly: false },
+        flags: { noCaching: false, noText: false, tagOnly: false, hideFilePath: false },
         resolveLevel: null,      // AgentName | Tar | Var | Sar | MetaThought
         resolveDepth: 1,         // ::Tar:2 → depth=2
         rawModifiers: rawModifiers,
@@ -80,6 +80,8 @@ function parseMultimodalParams(rawPlaceholder) {
                     result.flags.noText = true;
                 } else if (ls === 'tagonly') {
                     result.flags.tagOnly = true;
+                } else if (ls === 'hidefilepath') {
+                    result.flags.hideFilePath = true;
                 } else if (sub.includes(';') || sub.includes('.')) {
                     // 文件列表：logo.png;bar.png 或单个文件 logo.png
                     result.specifiedFiles.push(...sub.split(';').filter(Boolean));
@@ -115,10 +117,15 @@ function parseMultimodalParams(rawPlaceholder) {
             result.flags.tagOnly = true;
             continue;
         }
+        if (lower === 'hidefilepath') {
+            result.flags.hideFilePath = true;
+            continue;
+        }
 
         // 非已知关键字 → 预设名或 Agent 名
-        if (!result.presetName) {
-            result.presetName = part;
+        if (result.presetNames.length === 0) {
+            // 支持分号分隔的多个预设
+            result.presetNames = part.split(';').map(p => p.trim()).filter(Boolean);
         } else if (!result.resolveLevel) {
             // 第二个未知名 → 视为 resolveLevel（AgentName）
             result.resolveLevel = part;
@@ -133,9 +140,9 @@ function parseMultimodalParams(rawPlaceholder) {
         }
     }
 
-    // 如果有多模态 mode 但没有指定预设，默认使用 PresetDefault
-    if (result.mode && !result.presetName) {
-        result.presetName = 'PresetDefault';
+    // 如果有多模态 mode 但没有指定预设，默认使用 All (返回所有段落)
+    if (result.mode && result.presetNames.length === 0) {
+        result.presetNames = ['All'];
     }
 
     return result;

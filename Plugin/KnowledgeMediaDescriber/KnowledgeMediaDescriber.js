@@ -302,7 +302,6 @@ async function _actionListFiles(diaryName) {
             name: f,
             type: fileType,
             hasDescription: !!(desc && desc.description),
-            presetName: desc?.presetName || null,
             hasTags: !!(desc?.tags && desc.tags.trim())
         });
     }
@@ -320,11 +319,35 @@ async function _actionSetDesc(diaryName, fileName, body) {
     const mdm = getMediaDescriptionManager();
     if (!mdm) throw new Error('mediaDescriptionManager 未就绪');
     const filePath = path.join(getRootPath(), diaryName, fileName);
+    
+    const existing = await mdm.readDescription(filePath) || { description: '', tags: '', originalMetadata: {} };
+    
+    // 如果 body 中包含 fullDescription，则直接使用（由前端组装好的分段文本）
+    // 否则，如果是针对特定预设的更新
+    let newDescription = body.fullDescription !== undefined ? body.fullDescription : body.description;
+    
+    if (body.updatePreset && body.presetContent !== undefined) {
+        const segments = mdm.parseSegmentedDescription(existing.description);
+        const pName = body.updatePreset.startsWith('@') ? body.updatePreset.substring(1) : body.updatePreset;
+        
+        if (body.presetContent.trim()) {
+            segments.set(pName, body.presetContent.trim());
+        } else {
+            segments.delete(pName);
+        }
+        
+        let fullDesc = '';
+        for (const [segName, content] of segments) {
+            fullDesc += `[@${segName}:]\n${content}\n\n`;
+        }
+        newDescription = fullDesc.trim();
+    }
+
     await mdm.writeDescription(filePath, {
-        presetName: body.presetName || 'Manual',
-        description: body.description || '',
-        tags: body.tags || '',
-        modelUsed: 'manual-edit'
+        ...existing,
+        description: newDescription || '',
+        tags: body.tags !== undefined ? body.tags : existing.tags,
+        modelUsed: body.modelUsed || 'manual-edit'
     });
 }
 

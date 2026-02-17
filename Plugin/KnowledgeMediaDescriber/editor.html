@@ -67,11 +67,18 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
         <span class="preview-placeholder">预览区域</span>
       </div>
       <div class="form-group">
-        <label>预设名称</label>
-        <select id="presetSelect"><option value="PresetDefault">PresetDefault</option></select>
+        <label>当前编辑段落 (预设)</label>
+        <div style="display: flex; gap: 8px;">
+          <select id="presetSelect" style="flex: 1;" onchange="onPresetChange()">
+            <option value="@All">@All (全览)</option>
+            <option value="@Native">@Native (原生)</option>
+            <option value="@Manual">@Manual (手动)</option>
+          </select>
+          <button class="btn btn-secondary" onclick="addNewPresetSegment()" title="添加新预设段落">+</button>
+        </div>
       </div>
       <div class="form-group">
-        <label>描述信息</label>
+        <label id="descLabel">描述信息</label>
         <textarea id="descText" placeholder="输入文件描述..."></textarea>
       </div>
       <div class="form-group">
@@ -103,6 +110,8 @@ window.addEventListener('DOMContentLoaded', () => {
 const API_BASE = '/admin_api/media-describer';
 let currentDiary = null;
 let currentFile = null;
+let currentFullDescription = '';
+let segmentsMap = new Map();
 
 async function api(method, path, body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
@@ -172,9 +181,93 @@ async function selectFile(name) {
 async function loadPresets() {
   const data = await api('GET', '/presets');
   const sel = document.getElementById('presetSelect');
+  const currentVal = sel.value;
+  
+  // 1. 定义基础固定选项
+  const options = [
+    { value: '@All', text: '@All (全览)' },
+    { value: '@Native', text: '@Native (原生)' },
+    { value: '@Manual', text: '@Manual (手动)' }
+  ];
+  
+  // 2. 添加来自服务器的预设
   if (data.success && data.presets) {
-    sel.innerHTML = data.presets.map(p => `<option value="${p}">${p}</option>`).join('');
+    data.presets.forEach(p => {
+      // 过滤掉已经作为固定选项存在的名称
+      if (p !== 'Native' && p !== 'Manual' && p !== 'All') {
+        options.push({ value: p, text: p });
+      }
+    });
   }
+  
+  // 3. 添加来自当前文件描述中已存在的段落（如果不在列表中）
+  for (const pName of segmentsMap.keys()) {
+    if (!options.some(o => o.value === pName || o.value === '@' + pName)) {
+        options.push({ value: pName, text: pName });
+    }
+  }
+
+  // 渲染 HTML
+  sel.innerHTML = options.map(o => `<option value="${o.value}">${o.text}</option>`).join('');
+  
+  // 恢复之前的选中项
+  if ([...sel.options].some(o => o.value === currentVal)) {
+    sel.value = currentVal;
+  }
+}
+
+function parseSegments(fullDesc) {
+    const map = new Map();
+    if (!fullDesc) return map;
+
+    const regex = /\[@([^\]]+):\]([\s\S]*?)(?=\[@[^\]]+:\]|$)/g;
+    let match;
+    let hasMatches = false;
+
+    while ((match = regex.exec(fullDesc)) !== null) {
+        hasMatches = true;
+        const presetName = match[1].trim();
+        const content = match[2].trim();
+        if (content) {
+            map.set(presetName, content);
+        }
+    }
+
+    if (!hasMatches && fullDesc.trim()) {
+        map.set('Native', fullDesc.trim());
+    }
+
+    return map;
+}
+
+function onPresetChange() {
+    const sel = document.getElementById('presetSelect');
+    const val = sel.value;
+    const textarea = document.getElementById('descText');
+    const label = document.getElementById('descLabel');
+
+    if (val === '@All') {
+        textarea.value = currentFullDescription;
+        textarea.readOnly = false;
+        label.textContent = '完整描述内容 (包含标记)';
+    } else {
+        const pName = val.startsWith('@') ? val.substring(1) : val;
+        textarea.value = segmentsMap.get(pName) || '';
+        textarea.readOnly = false;
+        label.textContent = `描述信息 [${val}]`;
+    }
+}
+
+function addNewPresetSegment() {
+    const name = prompt('请输入新预设段落名称:');
+    if (!name) return;
+    const sel = document.getElementById('presetSelect');
+    const option = document.createElement('option');
+    option.value = name;
+    option.textContent = name;
+    sel.appendChild(option);
+    sel.value = name;
+    onPresetChange();
 }
 
 async function loadPreview() {
@@ -197,27 +290,58 @@ function getFileType(ext) {
 
 async function loadDescription() {
   const data = await api('GET', `/desc/${encodeURIComponent(currentDiary)}/${encodeURIComponent(currentFile)}`);
+  const sel = document.getElementById('presetSelect');
+  
   if (data.success && data.description) {
-    document.getElementById('presetSelect').value = data.description.presetName || 'PresetDefault';
-    document.getElementById('descText').value = data.description.description || '';
+    currentFullDescription = data.description.description || '';
+    segmentsMap = parseSegments(currentFullDescription);
     document.getElementById('tagsInput').value = data.description.tags || '';
+    
+    // 如果当前选中的是 @All 之外的，且该段落没内容，尝试切到有内容的第一个段落
+    if (sel.value === '@All') {
+        // 保持 @All
+    } else {
+        const pName = sel.value.startsWith('@') ? sel.value.substring(1) : sel.value;
+        if (!segmentsMap.has(pName)) {
+            // 尝试寻找第一个有内容的段落
+            for (const [k, v] of segmentsMap) {
+                sel.value = k === 'Native' ? '@Native' : (k === 'Manual' ? '@Manual' : k);
+                break;
+            }
+        }
+    }
   } else {
-    document.getElementById('presetSelect').value = 'PresetDefault';
-    document.getElementById('descText').value = '';
+    currentFullDescription = '';
+    segmentsMap = new Map();
     document.getElementById('tagsInput').value = '';
+    sel.value = '@Manual';
   }
+  
+  await loadPresets(); // 刷新下拉列表以包含 desc 中存在的自定义段落
+  onPresetChange();
 }
 
 async function saveDescription() {
   if (!currentDiary || !currentFile) return;
-  const body = {
-    presetName: document.getElementById('presetSelect').value,
-    description: document.getElementById('descText').value,
+  const sel = document.getElementById('presetSelect');
+  const val = sel.value;
+  const content = document.getElementById('descText').value;
+  
+  let body = {
     tags: document.getElementById('tagsInput').value
   };
+
+  if (val === '@All') {
+      body.fullDescription = content;
+  } else {
+      body.updatePreset = val.startsWith('@') ? val.substring(1) : val;
+      body.presetContent = content;
+  }
+
   const data = await api('PUT', `/desc/${encodeURIComponent(currentDiary)}/${encodeURIComponent(currentFile)}`, body);
   if (data.success) {
     toast('保存成功');
+    await loadDescription(); // 重新加载以更新内部状态
     selectDiary(currentDiary); // 刷新文件列表状态
   } else {
     toast('保存失败: ' + data.error, 'error');
@@ -226,17 +350,18 @@ async function saveDescription() {
 
 async function triggerRecognize(force = false) {
   if (!currentDiary || !currentFile) return;
-  const preset = document.getElementById('presetSelect').value;
+  let preset = document.getElementById('presetSelect').value;
+  if (preset.startsWith('@')) preset = preset.substring(1);
+  if (preset === 'All') preset = 'PresetDefault';
+
   const btn = force ? document.getElementById('btnRecognizeForce') : document.getElementById('btnRecognize');
   btn.disabled = true;
   btn.textContent = '识别中...';
   try {
     const data = await api('POST', `/recognize/${encodeURIComponent(currentDiary)}/${encodeURIComponent(currentFile)}?preset=${preset}&force=${force}`);
     if (data.success && data.description) {
-      document.getElementById('descText').value = data.description.description || '';
-      document.getElementById('tagsInput').value = data.description.tags || '';
-      document.getElementById('presetSelect').value = data.description.presetName || preset;
       toast('AI 识别完成');
+      await loadDescription();
       selectDiary(currentDiary);
     } else {
       toast('识别失败: ' + (data.error || '未知错误'), 'error');

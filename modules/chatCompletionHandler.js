@@ -507,9 +507,20 @@ class ChatCompletionHandler {
                 }
 
                 // 新建 user 消息承载 image_url parts
-                // 附带一个简短的文本说明，帮助模型理解上下文
+                // 附带详细的文本说明，帮助模型将文件名与附件对应
+                // 使用 [系统提示:] 开头防止被上下文截断
+                let introText = '[系统提示:][以下是系统提供的多模态文件内容]\n';
+                imageParts.forEach((p, idx) => {
+                    if (p.image_url && p.image_url.filePath) {
+                        const displayPath = p.image_url.hideFilePath
+                            ? path.basename(p.image_url.filePath)
+                            : p.image_url.filePath;
+                        introText += `附件 ${idx + 1}: ${displayPath}\n`;
+                    }
+                });
+
                 const imageUserParts = [
-                  { type: 'text', text: '[以下是系统提供的多模态文件内容]' },
+                  { type: 'text', text: introText.trim() },
                   ...imageParts
                 ];
                 expandedMessages.push({ role: 'user', content: imageUserParts });
