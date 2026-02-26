@@ -888,11 +888,11 @@ class KnowledgeBaseManager {
      */
     async getChunksByFilePaths(filePaths) {
         if (!filePaths || filePaths.length === 0) return [];
-        
+
         // 考虑到 SQLite 参数限制（通常为 999），如果路径过多需要分批
         const batchSize = 500;
         let allResults = [];
-        
+
         for (let i = 0; i < filePaths.length; i += batchSize) {
             const batch = filePaths.slice(i, i + batchSize);
             const placeholders = batch.map(() => '?').join(',');
@@ -902,7 +902,7 @@ class KnowledgeBaseManager {
                 JOIN files f ON c.file_id = f.id
                 WHERE f.path IN (${placeholders})
             `);
-            
+
             const rows = stmt.all(...batch);
             const processed = rows.map(r => ({
                 id: r.id,
@@ -912,7 +912,7 @@ class KnowledgeBaseManager {
             }));
             allResults.push(...processed);
         }
-        
+
         return allResults;
     }
 
@@ -1107,14 +1107,12 @@ class KnowledgeBaseManager {
                 const deletions = new Map(); // 💡 新增：记录待删除的 chunk ID
                 const tagUpdates = [];
 
-                const insertTag = this.db.prepare('INSERT OR IGNORE INTO tags (name, vector) VALUES (?, ?)');
-                const updateTag = this.db.prepare('UPDATE tags SET vector = ? WHERE name = ?');
+                const insertTag = this.db.prepare('INSERT INTO tags (name, vector) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET vector = excluded.vector');
                 const getTagId = this.db.prepare('SELECT id FROM tags WHERE name = ?');
 
                 newTags.forEach((t, i) => {
                     const vecBuf = Buffer.from(new Float32Array(tagVectors[i]).buffer);
                     insertTag.run(t, vecBuf);
-                    updateTag.run(vecBuf, t);
                     const id = getTagId.get(t).id;
                     tagCache.set(t, { id, vector: vecBuf });
                     tagUpdates.push({ id, vec: vecBuf });
@@ -1129,8 +1127,13 @@ class KnowledgeBaseManager {
                 const addChunk = this.db.prepare('INSERT INTO chunks (file_id, chunk_index, content, vector) VALUES (?, ?, ?, ?)');
                 const addRel = this.db.prepare('INSERT OR IGNORE INTO file_tags (file_id, tag_id) VALUES (?, ?)');
 
+                // 在事务前构建索引
+                const metaMap = new Map();
                 allChunksWithMeta.forEach((meta, i) => {
                     meta.vector = chunkVectors[i];
+                    // meta.doc 和 root meta.chunkIdx 是唯一标识一个 chunk的特征属性
+                    const key = `${meta.doc.relPath}:${meta.chunkIdx}`;
+                    metaMap.set(key, meta);
                 });
 
                 for (const [dName, docs] of docsByDiary) {
@@ -1160,7 +1163,7 @@ class KnowledgeBaseManager {
                         }
 
                         doc.chunks.forEach((txt, i) => {
-                            const meta = allChunksWithMeta.find(m => m.doc === doc && m.chunkIdx === i);
+                            const meta = metaMap.get(`${doc.relPath}:${i}`);
                             if (meta && meta.vector) {
                                 const vecBuf = Buffer.from(new Float32Array(meta.vector).buffer);
                                 const r = addChunk.run(fileId, i, txt, vecBuf);
